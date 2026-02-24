@@ -292,8 +292,18 @@ def get_market_status():
             'error': str(e)
         }), 500
 
-@app.route('/api/token-status')
-def token_status():
+@app.route('/api/debug-env')
+   def debug_env():
+       """Debug endpoint to check environment variables"""
+       import os
+       
+       return jsonify({
+           'DHAN_CLIENT_ID_exists': bool(os.environ.get('DHAN_CLIENT_ID')),
+           'DHAN_CLIENT_ID_length': len(os.environ.get('DHAN_CLIENT_ID', '')),
+           'DHAN_CLIENT_SECRET_exists': bool(os.environ.get('DHAN_CLIENT_SECRET')),
+           'DHAN_CLIENT_SECRET_length': len(os.environ.get('DHAN_CLIENT_SECRET', '')),
+           'note': 'Check if exists is True and length > 0'
+       })
     """Get token status"""
     try:
         if not dhan_token_info['access_token']:
