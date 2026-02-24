@@ -1,1 +1,192 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NIFTY Trading Bot</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+        }
+        h1 {
+            color: #667eea;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .status {
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: bold;
+        }
+        .success { background: #d4edda; color: #155724; }
+        .info { background: #d1ecf1; color: #0c5460; }
+        .warning { background: #fff3cd; color: #856404; }
+        button {
+            width: 100%;
+            padding: 15px;
+            margin: 10px 0;
+            font-size: 16px;
+            font-weight: bold;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            background: #667eea;
+            color: white;
+            transition: all 0.3s;
+        }
+        button:hover { background: #5568d3; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        #results {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            white-space: pre-wrap;
+            max-height: 400px;
+            overflow-y: auto;
+            font-size: 14px;
+        }
+        .price {
+            font-size: 36px;
+            font-weight: bold;
+            color: #28a745;
+            text-align: center;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 NIFTY Trading Bot</h1>
+        <div class="subtitle">Forward Testing & Backtesting System</div>
+        
+        <div class="status info" id="status">
+            ✅ Initializing...
+        </div>
+        
+        <div id="price" class="price"></div>
+        
+        <button onclick="testBackend()">🔄 Test Backend</button>
+        <button onclick="getNiftyPrice()">📈 Get NIFTY Price</button>
+        <button onclick="checkMarket()">🕐 Market Status</button>
+        <button onclick="checkToken()">🔑 Token Status</button>
+        
+        <div id="results"></div>
+    </div>
 
+    <script>
+        const API_URL = window.location.origin;
+        
+        window.onload = function() {
+            console.log('Bot loaded! API:', API_URL);
+            testBackend();
+        };
+        
+        async function testBackend() {
+            const status = document.getElementById('status');
+            const results = document.getElementById('results');
+            
+            try {
+                status.textContent = '🔄 Testing backend...';
+                status.className = 'status info';
+                
+                const response = await fetch(`${API_URL}/api/test`);
+                const data = await response.json();
+                
+                status.textContent = `✅ Backend Online | NSEpy: ${data.nsepy_available ? 'Yes' : 'No'} | Dhan: ${data.dhan_configured ? 'Yes' : 'No'}`;
+                status.className = 'status success';
+                results.textContent = JSON.stringify(data, null, 2);
+                
+                console.log('Backend test:', data);
+            } catch (error) {
+                status.textContent = '❌ Backend Error: ' + error.message;
+                status.className = 'status warning';
+                results.textContent = 'Error: ' + error.message;
+            }
+        }
+        
+        async function getNiftyPrice() {
+            const status = document.getElementById('status');
+            const results = document.getElementById('results');
+            const priceDiv = document.getElementById('price');
+            
+            try {
+                status.textContent = '📡 Fetching NIFTY price...';
+                status.className = 'status info';
+                
+                const response = await fetch(`${API_URL}/api/nifty-price`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    priceDiv.textContent = `₹${data.price.toFixed(2)}`;
+                    status.textContent = `✅ NIFTY Price Updated (${data.source})`;
+                    status.className = 'status success';
+                    results.textContent = JSON.stringify(data, null, 2);
+                } else {
+                    throw new Error(data.error || 'Failed to get price');
+                }
+            } catch (error) {
+                status.textContent = '❌ Price Fetch Failed: ' + error.message;
+                status.className = 'status warning';
+                priceDiv.textContent = '';
+            }
+        }
+        
+        async function checkMarket() {
+            const status = document.getElementById('status');
+            const results = document.getElementById('results');
+            
+            try {
+                const response = await fetch(`${API_URL}/api/market-status`);
+                const data = await response.json();
+                
+                status.textContent = `${data.is_open ? '🟢' : '🔴'} Market: ${data.is_open ? 'OPEN' : 'CLOSED'} | ${data.day}`;
+                status.className = data.is_open ? 'status success' : 'status warning';
+                results.textContent = JSON.stringify(data, null, 2);
+            } catch (error) {
+                status.textContent = '❌ Error: ' + error.message;
+                status.className = 'status warning';
+            }
+        }
+        
+        async function checkToken() {
+            const status = document.getElementById('status');
+            const results = document.getElementById('results');
+            
+            try {
+                const response = await fetch(`${API_URL}/api/token-status`);
+                const data = await response.json();
+                
+                if (data.valid) {
+                    status.textContent = `✅ Token Valid (${data.hours_remaining.toFixed(1)}h remaining)`;
+                    status.className = 'status success';
+                } else {
+                    status.textContent = `⚠️ ${data.message}`;
+                    status.className = 'status warning';
+                }
+                results.textContent = JSON.stringify(data, null, 2);
+            } catch (error) {
+                status.textContent = '❌ Error: ' + error.message;
+                status.className = 'status warning';
+            }
+        }
+    </script>
+</body>
+</html>
