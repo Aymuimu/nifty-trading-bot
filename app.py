@@ -6,7 +6,7 @@ import sys
 app = Flask(__name__, static_folder='public', static_url_path='')
 CORS(app)
 
-print("="*60)
+print("="*70)
 print("🚀 NIFTY Trading Bot Backend Starting...")
 print(f"Python version: {sys.version}")
 print("="*60)
