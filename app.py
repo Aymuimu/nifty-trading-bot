@@ -33,10 +33,10 @@ session_lock = threading.Lock()
 NIFTY_SYMBOL = "NIFTY"
 NIFTY_TOKEN  = "26000"
 EXCHANGE     = "NSE"
-LOT_SIZE     = 75        # NIFTY lot size (2026)
-STOP_LOSS    = 500       # ₹500 per trade
-BASE_TARGET  = 1500      # ₹1500 per trade
-EXT_TARGET   = 3000      # ₹3000 extended target
+LOT_SIZE     = 75
+STOP_LOSS    = 500
+BASE_TARGET  = 1500
+EXT_TARGET   = 3000
 
 
 # ══════════════════════════════════════════════════════════════
@@ -80,7 +80,6 @@ def login_smartapi():
 
 
 def auto_refresh_session():
-    """Background thread – re-login every 6 hours."""
     while True:
         time.sleep(6 * 3600)
         print("🔄 Auto-refreshing SmartAPI session...")
@@ -188,9 +187,9 @@ def is_trading_window():
 def window_label():
     t = ist_now().time()
     if datetime.time(10, 0) <= t <= datetime.time(11, 15):
-        return "Morning Window (10:00–11:15)"
+        return "Morning Window (10:00-11:15)"
     if datetime.time(13, 45) <= t <= datetime.time(14, 45):
-        return "Afternoon Window (1:45–2:45)"
+        return "Afternoon Window (1:45-2:45)"
     return "Outside trading windows"
 
 
@@ -244,11 +243,9 @@ def run_backtest(days=30):
                 e50     = row['ema50']
                 atr_now = row['atr']
 
-                # ATR rising last 3 candles
                 atr_slice = today_d['atr'].iloc[max(0, idx - 3):idx + 1]
                 atr_up    = bool(atr_slice.is_monotonic_increasing) if len(atr_slice) >= 3 else False
 
-                # Volume rising
                 vol_slice = today_d['volume'].iloc[max(0, idx - 3):idx + 1]
                 vol_up    = bool(vol_slice.iloc[-1] > vol_slice.mean()) if len(vol_slice) >= 2 else False
 
@@ -271,7 +268,6 @@ def run_backtest(days=30):
 
                 pnl     = 0
                 outcome = "TIME EXIT"
-                tick    = atr_now / 2  # approx option movement per index point
 
                 for fi in range(idx + 1, min(idx + 12, len(today_d))):
                     fc = today_d.iloc[fi]
@@ -310,14 +306,13 @@ def run_backtest(days=30):
         if not trades:
             return {'trades': [], 'summary': {'total_trades': 0, 'message': 'No setups found'}}, "OK"
 
-        wins   = [t for t in trades if t['pnl'] > 0]
-        losses = [t for t in trades if t['pnl'] < 0]
-        total  = sum(t['pnl'] for t in trades)
+        wins  = [t for t in trades if t['pnl'] > 0]
+        total = sum(t['pnl'] for t in trades)
 
         summary = {
             'total_trades':    len(trades),
             'wins':            len(wins),
-            'losses':          len(losses),
+            'losses':          len(trades) - len(wins),
             'win_rate':        round(len(wins) / len(trades) * 100, 1),
             'total_pnl':       round(total, 2),
             'initial_capital': 10000,
@@ -349,14 +344,14 @@ def index():
 @app.route('/api/test')
 def api_test():
     return jsonify({
-        'status':           'ok',
-        'message':          'NIFTY Options Bot – SmartAPI',
-        'configured':       all([SMARTAPI_KEY, SMARTAPI_CLIENT_ID, SMARTAPI_PASSWORD, SMARTAPI_TOTP_SECRET]),
-        'logged_in':        smart_obj is not None,
-        'market_open':      is_market_open(),
-        'trading_window':   is_trading_window(),
-        'window_label':     window_label(),
-        'timestamp':        datetime.datetime.utcnow().isoformat(),
+        'status':         'ok',
+        'message':        'NIFTY Options Bot - SmartAPI',
+        'configured':     all([SMARTAPI_KEY, SMARTAPI_CLIENT_ID, SMARTAPI_PASSWORD, SMARTAPI_TOTP_SECRET]),
+        'logged_in':      smart_obj is not None,
+        'market_open':    is_market_open(),
+        'trading_window': is_trading_window(),
+        'window_label':   window_label(),
+        'timestamp':      datetime.datetime.utcnow().isoformat(),
     })
 
 
@@ -364,10 +359,43 @@ def api_test():
 def api_login():
     success = login_smartapi()
     return jsonify({
-        'success': success,
-        'message': '✅ Login successful!' if success else '❌ Login failed – check credentials',
+        'success':   success,
+        'message':   '✅ Login successful!' if success else '❌ Login failed – check credentials',
         'logged_in': smart_obj is not None,
     })
+
+
+@app.route('/api/debug-login')
+def api_debug_login():
+    """Debug login – shows exact SmartAPI response to diagnose failures."""
+    try:
+        if not SMARTAPI_AVAILABLE:
+            return jsonify({'error': 'smartapi-python not installed'})
+
+        creds = {
+            'SMARTAPI_KEY':         '✅ Set' if SMARTAPI_KEY         else '❌ MISSING',
+            'SMARTAPI_CLIENT_ID':   '✅ Set' if SMARTAPI_CLIENT_ID   else '❌ MISSING',
+            'SMARTAPI_PASSWORD':    '✅ Set' if SMARTAPI_PASSWORD     else '❌ MISSING',
+            'SMARTAPI_TOTP_SECRET': '✅ Set' if SMARTAPI_TOTP_SECRET  else '❌ MISSING',
+        }
+
+        if not all([SMARTAPI_KEY, SMARTAPI_CLIENT_ID, SMARTAPI_PASSWORD, SMARTAPI_TOTP_SECRET]):
+            return jsonify({'error': 'Missing credentials', 'credentials': creds})
+
+        totp_code = generate_totp()
+        obj       = SmartConnect(api_key=SMARTAPI_KEY)
+        data      = obj.generateSession(SMARTAPI_CLIENT_ID, SMARTAPI_PASSWORD, totp_code)
+
+        return jsonify({
+            'credentials':        creds,
+            'totp_generated':     totp_code,
+            'api_key_length':     len(SMARTAPI_KEY),
+            'password_length':    len(SMARTAPI_PASSWORD),
+            'totp_secret_length': len(SMARTAPI_TOTP_SECRET),
+            'smartapi_response':  data,
+        })
+    except Exception as e:
+        return jsonify({'exception': str(e), 'type': type(e).__name__})
 
 
 @app.route('/api/session-status')
@@ -383,7 +411,7 @@ def api_session():
 def api_price():
     price, source = get_nifty_price()
     if price:
-        return jsonify({'success': True,  'price': price, 'source': source,
+        return jsonify({'success': True, 'price': price, 'source': source,
                         'timestamp': datetime.datetime.utcnow().isoformat()})
     return jsonify({'success': False, 'error': source})
 
@@ -407,12 +435,12 @@ def api_cpr():
         df, src = get_historical_data("ONE_DAY", 5)
         if df is None or len(df) < 2:
             return jsonify({'success': False, 'error': src or 'Not enough data'})
-        pd_row  = df.iloc[-2]
-        c       = cpr(pd_row['high'], pd_row['low'], pd_row['close'])
+        pd_row = df.iloc[-2]
+        c      = cpr(pd_row['high'], pd_row['low'], pd_row['close'])
         return jsonify({'success': True, **c, 'source': src,
-                        'prev_high': round(pd_row['high'], 2),
-                        'prev_low':  round(pd_row['low'],  2),
-                        'prev_close':round(pd_row['close'],2)})
+                        'prev_high':  round(pd_row['high'],  2),
+                        'prev_low':   round(pd_row['low'],   2),
+                        'prev_close': round(pd_row['close'], 2)})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -432,13 +460,12 @@ def api_indicators():
         if len(df) < 3:
             return jsonify({'success': False, 'error': 'Not enough data for indicators'})
 
-        r0, r1, r2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
-        price  = r0['close']
+        r0, r1, r2   = df.iloc[-1], df.iloc[-2], df.iloc[-3]
+        price        = r0['close']
         e9, e15, e50 = r0['ema9'], r0['ema15'], r0['ema50']
-        atr_up = bool(r0['atr'] > r1['atr'] > r2['atr'])
-        vol_up = bool(r0['volume'] > r1['volume'])
+        atr_up       = bool(r0['atr'] > r1['atr'] > r2['atr'])
+        vol_up       = bool(r0['volume'] > r1['volume'])
 
-        # CPR
         df_d, _ = get_historical_data("ONE_DAY", 5)
         day_cpr = None
         if df_d is not None and len(df_d) >= 2:
@@ -455,27 +482,27 @@ def api_indicators():
         put_ready  = put_trend  and put_cpr  and atr_up and vol_up and is_trading_window()
 
         return jsonify({
-            'success': True,
-            'price':   round(price, 2),
-            'ema9':    round(e9, 2),
-            'ema15':   round(e15, 2),
-            'ema50':   round(e50, 2),
-            'atr':     round(r0['atr'], 2),
+            'success':    True,
+            'price':      round(price, 2),
+            'ema9':       round(e9,    2),
+            'ema15':      round(e15,   2),
+            'ema50':      round(e50,   2),
+            'atr':        round(r0['atr'], 2),
             'atr_rising': atr_up,
-            'volume':  int(r0['volume']),
+            'volume':     int(r0['volume']),
             'vol_rising': vol_up,
-            'cpr':     day_cpr,
+            'cpr':        day_cpr,
             'signals': {
-                'call_trend':    call_trend,
-                'put_trend':     put_trend,
-                'call_cpr':      call_cpr,
-                'put_cpr':       put_cpr,
-                'inside_cpr':    inside_cpr,
-                'atr_ok':        atr_up,
-                'volume_ok':     vol_up,
+                'call_trend':     call_trend,
+                'put_trend':      put_trend,
+                'call_cpr':       call_cpr,
+                'put_cpr':        put_cpr,
+                'inside_cpr':     inside_cpr,
+                'atr_ok':         atr_up,
+                'volume_ok':      vol_up,
                 'trading_window': is_trading_window(),
-                'call_ready':    call_ready,
-                'put_ready':     put_ready,
+                'call_ready':     call_ready,
+                'put_ready':      put_ready,
             },
             'source':    src,
             'timestamp': datetime.datetime.utcnow().isoformat(),
@@ -486,7 +513,7 @@ def api_indicators():
 
 @app.route('/api/backtest')
 def api_backtest():
-    days   = int(request.args.get('days', 30))
+    days        = int(request.args.get('days', 30))
     result, msg = run_backtest(days)
     if result:
         return jsonify({'success': True, 'data': result})
@@ -507,8 +534,8 @@ print("=" * 60)
 
 if all([SMARTAPI_KEY, SMARTAPI_CLIENT_ID, SMARTAPI_PASSWORD, SMARTAPI_TOTP_SECRET]):
     print("🔄 Auto-login starting...")
-    threading.Thread(target=login_smartapi,        daemon=True).start()
-    threading.Thread(target=auto_refresh_session,  daemon=True).start()
+    threading.Thread(target=login_smartapi,       daemon=True).start()
+    threading.Thread(target=auto_refresh_session, daemon=True).start()
 else:
     print("⚠️  Set all 4 Railway variables, then redeploy.")
 
