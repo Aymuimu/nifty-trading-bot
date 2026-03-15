@@ -103,23 +103,35 @@ def get_nifty_price():
         return None, str(e)
 
 
+def get_last_trading_day():
+    """Returns last weekday to avoid weekend empty data"""
+    d = datetime.datetime.now()
+    while d.weekday() >= 5:   # Saturday=5, Sunday=6
+        d -= datetime.timedelta(days=1)
+    return d
+
+
 def get_historical_data(interval="FIFTEEN_MINUTE", days=30):
     global smart_obj
     try:
         if smart_obj is None:
             return None, "Not logged in"
-        to_dt   = datetime.datetime.now()
+
+        to_dt   = get_last_trading_day()
         from_dt = to_dt - datetime.timedelta(days=days)
-        param   = {
-            "exchange":    "NSE",
-            "symboltoken": "26000",
+
+        # Primary: NFO NIFTY futures (token 26009)
+        param = {
+            "exchange":    "NFO",
+            "symboltoken": "26009",
             "interval":    interval,
             "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
             "todate":      to_dt.strftime("%Y-%m-%d %H:%M"),
         }
-        print(f"📡 Historical request: {param}")
+        print(f"📡 Historical request (NFO): {param}")
         data = smart_obj.getCandleData(param)
-        print(f"📡 Historical response: {data}")
+        print(f"📡 NFO response: status={data.get('status') if data else None}, rows={len(data.get('data', [])) if data else 0}")
+
         if data and data.get('status') and data.get('data'):
             df = pd.DataFrame(
                 data['data'],
@@ -127,8 +139,29 @@ def get_historical_data(interval="FIFTEEN_MINUTE", days=30):
             )
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             return df, "SmartAPI"
-        error_msg  = data.get('message',   'Unknown error') if data else 'No response'
-        error_code = data.get('errorcode', '')              if data else ''
+
+        # Fallback: NSE index token 26000
+        param2 = {
+            "exchange":    "NSE",
+            "symboltoken": "26000",
+            "interval":    interval,
+            "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
+            "todate":      to_dt.strftime("%Y-%m-%d %H:%M"),
+        }
+        print(f"📡 Historical request (NSE fallback): {param2}")
+        data2 = smart_obj.getCandleData(param2)
+        print(f"📡 NSE response: status={data2.get('status') if data2 else None}, rows={len(data2.get('data', [])) if data2 else 0}")
+
+        if data2 and data2.get('status') and data2.get('data'):
+            df = pd.DataFrame(
+                data2['data'],
+                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            )
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            return df, "SmartAPI"
+
+        error_msg  = data.get('message',   'Unknown') if data else 'No response'
+        error_code = data.get('errorcode', '')         if data else ''
         return None, f"SmartAPI error {error_code}: {error_msg}"
     except Exception as e:
         return None, f"Exception: {str(e)}"
@@ -406,28 +439,41 @@ def api_debug_historical():
     try:
         if smart_obj is None:
             return jsonify({'error': 'Not logged in – click Login first'})
-        to_dt   = datetime.datetime.now()
+
+        to_dt   = get_last_trading_day()
         from_dt = to_dt - datetime.timedelta(days=5)
-        param   = {
-            "exchange":    "NSE",
-            "symboltoken": "26000",
-            "interval":    "FIFTEEN_MINUTE",
-            "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
-            "todate":      to_dt.strftime("%Y-%m-%d %H:%M"),
-        }
-        data = smart_obj.getCandleData(param)
-        rows = len(data.get('data', [])) if data and data.get('data') else 0
+
+        results = {}
+        for exchange, token in [("NSE", "26000"), ("NFO", "26009")]:
+            param = {
+                "exchange":    exchange,
+                "symboltoken": token,
+                "interval":    "FIFTEEN_MINUTE",
+                "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
+                "todate":      to_dt.strftime("%Y-%m-%d %H:%M"),
+            }
+            try:
+                data = smart_obj.getCandleData(param)
+                results[f"{exchange}_{token}"] = {
+                    'status':    data.get('status')    if data else None,
+                    'message':   data.get('message')   if data else None,
+                    'errorcode': data.get('errorcode') if data else None,
+                    'rows':      len(data.get('data', [])) if data else 0,
+                    'sample':    data.get('data', [])[:2]  if data else [],
+                }
+            except Exception as e:
+                results[f"{exchange}_{token}"] = {'error': str(e)}
+
         return jsonify({
             'logged_in':  True,
-            'params':     param,
-            'status':     data.get('status')    if data else None,
-            'message':    data.get('message')   if data else None,
-            'errorcode':  data.get('errorcode') if data else None,
-            'rows_returned': rows,
-            'sample':     data.get('data', [])[:3] if data else None,
+            'date_range': {
+                'from': from_dt.strftime("%Y-%m-%d"),
+                'to':   to_dt.strftime("%Y-%m-%d"),
+            },
+            'results': results,
         })
     except Exception as e:
-        return jsonify({'exception': str(e), 'type': type(e).__name__})
+        return jsonify({'exception': str(e)})
 
 
 @app.route('/api/session-status')
