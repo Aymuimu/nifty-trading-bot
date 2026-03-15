@@ -111,13 +111,15 @@ def get_historical_data(interval="FIFTEEN_MINUTE", days=30):
         to_dt   = datetime.datetime.now()
         from_dt = to_dt - datetime.timedelta(days=days)
         param   = {
-            "exchange":    EXCHANGE,
-            "symboltoken": NIFTY_TOKEN,
+            "exchange":    "NSE",
+            "symboltoken": "26000",
             "interval":    interval,
             "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
             "todate":      to_dt.strftime("%Y-%m-%d %H:%M"),
         }
+        print(f"📡 Historical request: {param}")
         data = smart_obj.getCandleData(param)
+        print(f"📡 Historical response: {data}")
         if data and data.get('status') and data.get('data'):
             df = pd.DataFrame(
                 data['data'],
@@ -125,9 +127,11 @@ def get_historical_data(interval="FIFTEEN_MINUTE", days=30):
             )
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             return df, "SmartAPI"
-        return None, "Historical fetch failed"
+        error_msg  = data.get('message',   'Unknown error') if data else 'No response'
+        error_code = data.get('errorcode', '')              if data else ''
+        return None, f"SmartAPI error {error_code}: {error_msg}"
     except Exception as e:
-        return None, str(e)
+        return None, f"Exception: {str(e)}"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -367,7 +371,6 @@ def api_login():
 
 @app.route('/api/debug-login')
 def api_debug_login():
-    """Debug login – shows exact SmartAPI response to diagnose failures."""
     try:
         if not SMARTAPI_AVAILABLE:
             return jsonify({'error': 'smartapi-python not installed'})
@@ -393,6 +396,35 @@ def api_debug_login():
             'password_length':    len(SMARTAPI_PASSWORD),
             'totp_secret_length': len(SMARTAPI_TOTP_SECRET),
             'smartapi_response':  data,
+        })
+    except Exception as e:
+        return jsonify({'exception': str(e), 'type': type(e).__name__})
+
+
+@app.route('/api/debug-historical')
+def api_debug_historical():
+    try:
+        if smart_obj is None:
+            return jsonify({'error': 'Not logged in – click Login first'})
+        to_dt   = datetime.datetime.now()
+        from_dt = to_dt - datetime.timedelta(days=5)
+        param   = {
+            "exchange":    "NSE",
+            "symboltoken": "26000",
+            "interval":    "FIFTEEN_MINUTE",
+            "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
+            "todate":      to_dt.strftime("%Y-%m-%d %H:%M"),
+        }
+        data = smart_obj.getCandleData(param)
+        rows = len(data.get('data', [])) if data and data.get('data') else 0
+        return jsonify({
+            'logged_in':  True,
+            'params':     param,
+            'status':     data.get('status')    if data else None,
+            'message':    data.get('message')   if data else None,
+            'errorcode':  data.get('errorcode') if data else None,
+            'rows_returned': rows,
+            'sample':     data.get('data', [])[:3] if data else None,
         })
     except Exception as e:
         return jsonify({'exception': str(e), 'type': type(e).__name__})
