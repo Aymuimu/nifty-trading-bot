@@ -30,13 +30,9 @@ session_data = None
 session_lock = threading.Lock()
 
 # ─── Strategy constants ────────────────────────────────────────
-NIFTY_SYMBOL = "NIFTY"
-NIFTY_TOKEN  = "26000"
-EXCHANGE     = "NSE"
-LOT_SIZE     = 75
-STOP_LOSS    = 500
-BASE_TARGET  = 1500
-EXT_TARGET   = 3000
+LOT_SIZE    = 75
+STOP_LOSS   = 500
+BASE_TARGET = 1500
 
 
 # ══════════════════════════════════════════════════════════════
@@ -54,10 +50,9 @@ def generate_totp():
 def login_smartapi():
     global smart_obj, session_data
     if not all([SMARTAPI_KEY, SMARTAPI_CLIENT_ID, SMARTAPI_PASSWORD, SMARTAPI_TOTP_SECRET]):
-        print("⚠️ SmartAPI credentials not fully configured")
+        print("⚠️ Credentials not fully configured")
         return False
     if not SMARTAPI_AVAILABLE:
-        print("⚠️ SmartAPI library not installed")
         return False
     try:
         totp_code = generate_totp()
@@ -72,30 +67,111 @@ def login_smartapi():
                 session_data['login_time'] = datetime.datetime.now().isoformat()
             print("✅ SmartAPI login successful!")
             return True
-        print(f"❌ SmartAPI login failed: {data}")
+        print(f"❌ Login failed: {data}")
         return False
     except Exception as e:
-        print(f"❌ SmartAPI login error: {e}")
+        print(f"❌ Login error: {e}")
         return False
 
 
 def auto_refresh_session():
     while True:
         time.sleep(6 * 3600)
-        print("🔄 Auto-refreshing SmartAPI session...")
         login_smartapi()
 
 
 # ══════════════════════════════════════════════════════════════
-#  DATA FETCHING
+#  TIME HELPERS
 # ══════════════════════════════════════════════════════════════
 
+def ist_now():
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
+
+
+def get_last_trading_day():
+    d = datetime.datetime.now()
+    while d.weekday() >= 5:
+        d -= datetime.timedelta(days=1)
+    return d
+
+
+def is_market_open():
+    n = ist_now()
+    if n.weekday() >= 5:
+        return False
+    return datetime.time(9, 15) <= n.time() <= datetime.time(15, 30)
+
+
+def is_trading_window():
+    t = ist_now().time()
+    return (datetime.time(10, 0) <= t <= datetime.time(11, 15) or
+            datetime.time(13, 45) <= t <= datetime.time(14, 45))
+
+
+def window_label():
+    t = ist_now().time()
+    if datetime.time(10, 0) <= t <= datetime.time(11, 15):
+        return "Morning Window (10:00-11:15)"
+    if datetime.time(13, 45) <= t <= datetime.time(14, 45):
+        return "Afternoon Window (1:45-2:45)"
+    return "Outside trading windows"
+
+
+# ══════════════════════════════════════════════════════════════
+#  DATA FETCHING — tries multiple tokens until one works
+# ══════════════════════════════════════════════════════════════
+
+# Candidates in priority order: (exchange, token, label)
+NIFTY_CANDIDATES = [
+    ("NSE",  "26000",  "NSE NIFTY index"),
+    ("NFO",  "26009",  "NFO NIFTY futures"),
+    ("NFO",  "35001",  "NFO NIFTY alt"),
+    ("NFO",  "43394",  "NFO NIFTY Mar26"),
+    ("NFO",  "36474",  "NFO NIFTY alt2"),
+]
+
+# Cache the working token so we don't retry every call
+_working_token = None
+
+
+def find_working_token():
+    global _working_token
+    if _working_token:
+        return _working_token
+    if smart_obj is None:
+        return None
+
+    to_dt   = get_last_trading_day()
+    from_dt = to_dt - datetime.timedelta(days=3)
+
+    for exchange, token, label in NIFTY_CANDIDATES:
+        try:
+            param = {
+                "exchange":    exchange,
+                "symboltoken": token,
+                "interval":    "ONE_DAY",
+                "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
+                "todate":      to_dt.strftime("%Y-%m-%d %H:%M"),
+            }
+            data = smart_obj.getCandleData(param)
+            rows = len(data.get('data', [])) if data else 0
+            print(f"  Token test {exchange}/{token} ({label}): {rows} rows")
+            if data and data.get('status') and rows > 0:
+                _working_token = (exchange, token, label)
+                print(f"✅ Using token: {exchange}/{token} ({label})")
+                return _working_token
+        except Exception as e:
+            print(f"  Token test {exchange}/{token} error: {e}")
+
+    print("❌ No working token found")
+    return None
+
+
 def get_nifty_price():
-    global smart_obj
     try:
         if smart_obj is None:
             return None, "Not logged in"
-        ltp = smart_obj.ltpData(EXCHANGE, NIFTY_SYMBOL, NIFTY_TOKEN)
+        ltp = smart_obj.ltpData("NSE", "NIFTY", "26000")
         if ltp and ltp.get('status'):
             return float(ltp['data']['ltp']), "SmartAPI (live)"
         return None, "LTP fetch failed"
@@ -103,34 +179,29 @@ def get_nifty_price():
         return None, str(e)
 
 
-def get_last_trading_day():
-    """Returns last weekday to avoid weekend empty data"""
-    d = datetime.datetime.now()
-    while d.weekday() >= 5:   # Saturday=5, Sunday=6
-        d -= datetime.timedelta(days=1)
-    return d
-
-
 def get_historical_data(interval="FIFTEEN_MINUTE", days=30):
-    global smart_obj
+    global _working_token
     try:
         if smart_obj is None:
             return None, "Not logged in"
 
+        token_info = find_working_token()
+        if not token_info:
+            return None, "No working data token found — check account permissions"
+
+        exchange, token, label = token_info
         to_dt   = get_last_trading_day()
         from_dt = to_dt - datetime.timedelta(days=days)
 
-        # Primary: NFO NIFTY futures (token 26009)
         param = {
-            "exchange":    "NFO",
-            "symboltoken": "26009",
+            "exchange":    exchange,
+            "symboltoken": token,
             "interval":    interval,
             "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
             "todate":      to_dt.strftime("%Y-%m-%d %H:%M"),
         }
-        print(f"📡 Historical request (NFO): {param}")
+        print(f"📡 Fetching {interval} data via {exchange}/{token}: {from_dt.date()} → {to_dt.date()}")
         data = smart_obj.getCandleData(param)
-        print(f"📡 NFO response: status={data.get('status') if data else None}, rows={len(data.get('data', [])) if data else 0}")
 
         if data and data.get('status') and data.get('data'):
             df = pd.DataFrame(
@@ -138,31 +209,16 @@ def get_historical_data(interval="FIFTEEN_MINUTE", days=30):
                 columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
             )
             df['timestamp'] = pd.to_datetime(df['timestamp'])
-            return df, "SmartAPI"
+            print(f"✅ Got {len(df)} rows from {label}")
+            return df, f"SmartAPI ({label})"
 
-        # Fallback: NSE index token 26000
-        param2 = {
-            "exchange":    "NSE",
-            "symboltoken": "26000",
-            "interval":    interval,
-            "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
-            "todate":      to_dt.strftime("%Y-%m-%d %H:%M"),
-        }
-        print(f"📡 Historical request (NSE fallback): {param2}")
-        data2 = smart_obj.getCandleData(param2)
-        print(f"📡 NSE response: status={data2.get('status') if data2 else None}, rows={len(data2.get('data', [])) if data2 else 0}")
-
-        if data2 and data2.get('status') and data2.get('data'):
-            df = pd.DataFrame(
-                data2['data'],
-                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-            )
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            return df, "SmartAPI"
-
+        # Token stopped working — reset and try again next call
+        print(f"⚠️ Token {exchange}/{token} returned 0 rows, resetting cache")
+        _working_token = None
         error_msg  = data.get('message',   'Unknown') if data else 'No response'
         error_code = data.get('errorcode', '')         if data else ''
-        return None, f"SmartAPI error {error_code}: {error_msg}"
+        return None, f"SmartAPI {error_code}: {error_msg}"
+
     except Exception as e:
         return None, f"Exception: {str(e)}"
 
@@ -179,10 +235,8 @@ def atr(df, period=14):
     d = df.copy()
     d['tr'] = np.maximum(
         d['high'] - d['low'],
-        np.maximum(
-            abs(d['high'] - d['close'].shift(1)),
-            abs(d['low']  - d['close'].shift(1))
-        )
+        np.maximum(abs(d['high'] - d['close'].shift(1)),
+                   abs(d['low']  - d['close'].shift(1)))
     )
     return d['tr'].rolling(period).mean()
 
@@ -196,38 +250,6 @@ def cpr(prev_high, prev_low, prev_close):
         'cpr_top':    round(max(bc, tc), 2),
         'cpr_bottom': round(min(bc, tc), 2),
     }
-
-
-# ══════════════════════════════════════════════════════════════
-#  TIME HELPERS
-# ══════════════════════════════════════════════════════════════
-
-def ist_now():
-    return datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
-
-
-def is_market_open():
-    n = ist_now()
-    if n.weekday() >= 5:
-        return False
-    t = n.time()
-    return datetime.time(9, 15) <= t <= datetime.time(15, 30)
-
-
-def is_trading_window():
-    t = ist_now().time()
-    morning   = datetime.time(10,  0) <= t <= datetime.time(11, 15)
-    afternoon = datetime.time(13, 45) <= t <= datetime.time(14, 45)
-    return morning or afternoon
-
-
-def window_label():
-    t = ist_now().time()
-    if datetime.time(10, 0) <= t <= datetime.time(11, 15):
-        return "Morning Window (10:00-11:15)"
-    if datetime.time(13, 45) <= t <= datetime.time(14, 45):
-        return "Afternoon Window (1:45-2:45)"
-    return "Outside trading windows"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -267,37 +289,28 @@ def run_backtest(days=30):
                 if trades_today >= 2 or sl_today:
                     break
 
-                row  = today_d.iloc[idx]
-                t    = row['timestamp'].time()
-                morn = datetime.time(10, 0) <= t <= datetime.time(11, 15)
-                aft  = datetime.time(13, 45) <= t <= datetime.time(14, 45)
-                if not (morn or aft):
+                row = today_d.iloc[idx]
+                t   = row['timestamp'].time()
+                if not (datetime.time(10, 0) <= t <= datetime.time(11, 15) or
+                        datetime.time(13, 45) <= t <= datetime.time(14, 45)):
                     continue
 
-                price   = row['close']
-                e9      = row['ema9']
-                e15     = row['ema15']
-                e50     = row['ema50']
-                atr_now = row['atr']
+                price = row['close']
+                e9    = row['ema9']
+                e15   = row['ema15']
+                e50   = row['ema50']
 
-                atr_slice = today_d['atr'].iloc[max(0, idx - 3):idx + 1]
+                atr_slice = today_d['atr'].iloc[max(0, idx-3):idx+1]
                 atr_up    = bool(atr_slice.is_monotonic_increasing) if len(atr_slice) >= 3 else False
-
-                vol_slice = today_d['volume'].iloc[max(0, idx - 3):idx + 1]
+                vol_slice = today_d['volume'].iloc[max(0, idx-3):idx+1]
                 vol_up    = bool(vol_slice.iloc[-1] > vol_slice.mean()) if len(vol_slice) >= 2 else False
 
-                call_ok = (
-                    price > e9 > e15 > e50
-                    and price > day_cpr['cpr_top']
-                    and row['close'] > row['open']
-                    and atr_up and vol_up
-                )
-                put_ok = (
-                    price < e9 < e15 < e50
-                    and price < day_cpr['cpr_bottom']
-                    and row['close'] < row['open']
-                    and atr_up and vol_up
-                )
+                call_ok = (price > e9 > e15 > e50 and
+                           price > day_cpr['cpr_top'] and
+                           row['close'] > row['open'] and atr_up and vol_up)
+                put_ok  = (price < e9 < e15 < e50 and
+                           price < day_cpr['cpr_bottom'] and
+                           row['close'] < row['open'] and atr_up and vol_up)
 
                 side = "CALL" if call_ok else ("PUT" if put_ok else None)
                 if side is None:
@@ -306,21 +319,21 @@ def run_backtest(days=30):
                 pnl     = 0
                 outcome = "TIME EXIT"
 
-                for fi in range(idx + 1, min(idx + 12, len(today_d))):
+                for fi in range(idx+1, min(idx+12, len(today_d))):
                     fc = today_d.iloc[fi]
                     if side == "CALL":
-                        if fc['low'] < price - STOP_LOSS / LOT_SIZE:
-                            pnl = -STOP_LOSS; outcome = "SL HIT"; sl_today = True; break
+                        if fc['low']  < price - STOP_LOSS   / LOT_SIZE:
+                            pnl = -STOP_LOSS;  outcome = "SL HIT"; sl_today = True; break
                         if fc['high'] > price + BASE_TARGET / LOT_SIZE:
-                            pnl = BASE_TARGET; outcome = "TARGET"; break
+                            pnl =  BASE_TARGET; outcome = "TARGET"; break
                     else:
-                        if fc['high'] > price + STOP_LOSS / LOT_SIZE:
-                            pnl = -STOP_LOSS; outcome = "SL HIT"; sl_today = True; break
-                        if fc['low'] < price - BASE_TARGET / LOT_SIZE:
-                            pnl = BASE_TARGET; outcome = "TARGET"; break
+                        if fc['high'] > price + STOP_LOSS   / LOT_SIZE:
+                            pnl = -STOP_LOSS;  outcome = "SL HIT"; sl_today = True; break
+                        if fc['low']  < price - BASE_TARGET / LOT_SIZE:
+                            pnl =  BASE_TARGET; outcome = "TARGET"; break
 
                 if pnl == 0:
-                    exit_row = today_d.iloc[min(idx + 6, len(today_d) - 1)]
+                    exit_row = today_d.iloc[min(idx+6, len(today_d)-1)]
                     raw_pnl  = (exit_row['close'] - price) * LOT_SIZE
                     pnl      = int(raw_pnl if side == "CALL" else -raw_pnl)
 
@@ -341,11 +354,14 @@ def run_backtest(days=30):
                 })
 
         if not trades:
-            return {'trades': [], 'summary': {'total_trades': 0, 'message': 'No setups found'}}, "OK"
+            return {'trades': [], 'summary': {
+                'total_trades': 0,
+                'message': 'No setups found matching all strategy filters',
+                'source': src,
+            }}, "OK"
 
         wins  = [t for t in trades if t['pnl'] > 0]
         total = sum(t['pnl'] for t in trades)
-
         summary = {
             'total_trades':    len(trades),
             'wins':            len(wins),
@@ -375,7 +391,7 @@ def index():
     try:
         return send_from_directory('public', 'index.html')
     except Exception as e:
-        return f"<h2>Bot is running</h2><p>UI error: {e}</p><a href='/api/test'>Test API</a>"
+        return f"<h2>Bot running</h2><a href='/api/test'>Test API</a>"
 
 
 @app.route('/api/test')
@@ -385,6 +401,7 @@ def api_test():
         'message':        'NIFTY Options Bot - SmartAPI',
         'configured':     all([SMARTAPI_KEY, SMARTAPI_CLIENT_ID, SMARTAPI_PASSWORD, SMARTAPI_TOTP_SECRET]),
         'logged_in':      smart_obj is not None,
+        'working_token':  str(_working_token),
         'market_open':    is_market_open(),
         'trading_window': is_trading_window(),
         'window_label':   window_label(),
@@ -397,7 +414,7 @@ def api_login():
     success = login_smartapi()
     return jsonify({
         'success':   success,
-        'message':   '✅ Login successful!' if success else '❌ Login failed – check credentials',
+        'message':   '✅ Login successful!' if success else '❌ Login failed',
         'logged_in': smart_obj is not None,
     })
 
@@ -407,21 +424,17 @@ def api_debug_login():
     try:
         if not SMARTAPI_AVAILABLE:
             return jsonify({'error': 'smartapi-python not installed'})
-
         creds = {
             'SMARTAPI_KEY':         '✅ Set' if SMARTAPI_KEY         else '❌ MISSING',
             'SMARTAPI_CLIENT_ID':   '✅ Set' if SMARTAPI_CLIENT_ID   else '❌ MISSING',
             'SMARTAPI_PASSWORD':    '✅ Set' if SMARTAPI_PASSWORD     else '❌ MISSING',
             'SMARTAPI_TOTP_SECRET': '✅ Set' if SMARTAPI_TOTP_SECRET  else '❌ MISSING',
         }
-
         if not all([SMARTAPI_KEY, SMARTAPI_CLIENT_ID, SMARTAPI_PASSWORD, SMARTAPI_TOTP_SECRET]):
             return jsonify({'error': 'Missing credentials', 'credentials': creds})
-
         totp_code = generate_totp()
         obj       = SmartConnect(api_key=SMARTAPI_KEY)
         data      = obj.generateSession(SMARTAPI_CLIENT_ID, SMARTAPI_PASSWORD, totp_code)
-
         return jsonify({
             'credentials':        creds,
             'totp_generated':     totp_code,
@@ -431,46 +444,68 @@ def api_debug_login():
             'smartapi_response':  data,
         })
     except Exception as e:
-        return jsonify({'exception': str(e), 'type': type(e).__name__})
+        return jsonify({'exception': str(e)})
 
 
 @app.route('/api/debug-historical')
 def api_debug_historical():
+    """Tests all known NIFTY tokens and reports which ones return data"""
     try:
         if smart_obj is None:
-            return jsonify({'error': 'Not logged in – click Login first'})
+            return jsonify({'error': 'Not logged in — click Login first'})
 
         to_dt   = get_last_trading_day()
-        from_dt = to_dt - datetime.timedelta(days=5)
-
+        from_dt = to_dt - datetime.timedelta(days=3)
         results = {}
-        for exchange, token in [("NSE", "26000"), ("NFO", "26009")]:
+
+        tests = [
+            ("NSE", "26000", "ONE_DAY"),
+            ("NSE", "26000", "FIFTEEN_MINUTE"),
+            ("NSE", "26000", "ONE_MINUTE"),
+            ("NFO", "26009", "ONE_DAY"),
+            ("NFO", "26009", "FIFTEEN_MINUTE"),
+            ("NFO", "43394", "ONE_DAY"),
+            ("NFO", "43394", "FIFTEEN_MINUTE"),
+            ("NFO", "35001", "ONE_DAY"),
+        ]
+
+        for exchange, token, interval in tests:
             param = {
                 "exchange":    exchange,
                 "symboltoken": token,
-                "interval":    "FIFTEEN_MINUTE",
+                "interval":    interval,
                 "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
                 "todate":      to_dt.strftime("%Y-%m-%d %H:%M"),
             }
             try:
                 data = smart_obj.getCandleData(param)
-                results[f"{exchange}_{token}"] = {
+                rows = len(data.get('data', [])) if data else 0
+                results[f"{exchange}_{token}_{interval}"] = {
                     'status':    data.get('status')    if data else None,
                     'message':   data.get('message')   if data else None,
                     'errorcode': data.get('errorcode') if data else None,
-                    'rows':      len(data.get('data', [])) if data else 0,
-                    'sample':    data.get('data', [])[:2]  if data else [],
+                    'rows':      rows,
+                    'sample':    data.get('data', [])[:1] if data else [],
                 }
             except Exception as e:
-                results[f"{exchange}_{token}"] = {'error': str(e)}
+                results[f"{exchange}_{token}_{interval}"] = {'error': str(e)}
+
+        # Also try to search for NIFTY scrip
+        try:
+            search = smart_obj.searchScrip("NSE", "NIFTY")
+            results['scrip_search'] = search
+        except Exception as e:
+            results['scrip_search'] = {'error': str(e)}
+
+        # Check allotted exchanges on session
+        exchanges = session_data.get('data', {}).get('exchanges', []) if session_data else []
 
         return jsonify({
-            'logged_in':  True,
-            'date_range': {
-                'from': from_dt.strftime("%Y-%m-%d"),
-                'to':   to_dt.strftime("%Y-%m-%d"),
-            },
-            'results': results,
+            'date_range':          {'from': from_dt.strftime("%Y-%m-%d %H:%M"),
+                                    'to':   to_dt.strftime("%Y-%m-%d %H:%M")},
+            'account_exchanges':   exchanges,
+            'working_token_cache': str(_working_token),
+            'results':             results,
         })
     except Exception as e:
         return jsonify({'exception': str(e)})
@@ -507,22 +542,6 @@ def api_market():
     })
 
 
-@app.route('/api/cpr')
-def api_cpr():
-    try:
-        df, src = get_historical_data("ONE_DAY", 5)
-        if df is None or len(df) < 2:
-            return jsonify({'success': False, 'error': src or 'Not enough data'})
-        pd_row = df.iloc[-2]
-        c      = cpr(pd_row['high'], pd_row['low'], pd_row['close'])
-        return jsonify({'success': True, **c, 'source': src,
-                        'prev_high':  round(pd_row['high'],  2),
-                        'prev_low':   round(pd_row['low'],   2),
-                        'prev_close': round(pd_row['close'], 2)})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-
 @app.route('/api/indicators')
 def api_indicators():
     try:
@@ -536,7 +555,7 @@ def api_indicators():
         df['atr']   = atr(df)
         df = df.dropna()
         if len(df) < 3:
-            return jsonify({'success': False, 'error': 'Not enough data for indicators'})
+            return jsonify({'success': False, 'error': 'Not enough candles for indicators'})
 
         r0, r1, r2   = df.iloc[-1], df.iloc[-2], df.iloc[-3]
         price        = r0['close']
@@ -555,7 +574,6 @@ def api_indicators():
         call_cpr   = bool(day_cpr and price > day_cpr['cpr_top'])
         put_cpr    = bool(day_cpr and price < day_cpr['cpr_bottom'])
         inside_cpr = bool(day_cpr and day_cpr['cpr_bottom'] < price < day_cpr['cpr_top'])
-
         call_ready = call_trend and call_cpr and atr_up and vol_up and is_trading_window()
         put_ready  = put_trend  and put_cpr  and atr_up and vol_up and is_trading_window()
 
