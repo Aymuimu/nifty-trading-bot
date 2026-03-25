@@ -35,6 +35,7 @@ last_ltp      = None
 
 LOT_SIZE    = 75
 SA_BASE     = "https://apiconnect.angelbroking.com"
+MIN_SCORE   = 10   # out of 13
 
 
 # ══════════════════════════════════════════════════════════════
@@ -47,7 +48,8 @@ def generate_totp():
 
 def login_smartapi():
     global smart_obj, session_data, jwt_token
-    if not all([SMARTAPI_KEY,SMARTAPI_CLIENT_ID,SMARTAPI_PASSWORD,SMARTAPI_TOTP_SECRET]): return False
+    if not all([SMARTAPI_KEY,SMARTAPI_CLIENT_ID,SMARTAPI_PASSWORD,SMARTAPI_TOTP_SECRET]):
+        return False
     if not SMARTAPI_AVAILABLE: return False
     try:
         totp = generate_totp()
@@ -126,7 +128,7 @@ def smartapi_rest_candles(exchange, token, interval, from_dt, to_dt):
     try:
         headers = {
             'Authorization': f'Bearer {jwt_token}',
-            'Content-Type': 'application/json', 'Accept': 'application/json',
+            'Content-Type': 'application/json','Accept':'application/json',
             'X-UserType':'USER','X-SourceID':'WEB',
             'X-ClientLocalIP':'127.0.0.1','X-ClientPublicIP':'127.0.0.1',
             'X-MACAddress':'00:00:00:00:00:00','X-PrivateKey':SMARTAPI_KEY,
@@ -159,142 +161,137 @@ def sample_ltp_to_buffer():
     global candle_buffer
     price, _ = get_nifty_price()
     if price is None: return
-    now = ist_now(); bucket = bucket_15m(now); key = bucket.strftime("%Y-%m-%d %H:%M")
+    now=ist_now(); key=bucket_15m(now).strftime("%Y-%m-%d %H:%M")
     if key not in candle_buffer:
-        candle_buffer[key] = {'timestamp':bucket,'open':price,'high':price,'low':price,'close':price,'volume':1}
+        candle_buffer[key]={'timestamp':bucket_15m(now),'open':price,'high':price,
+                             'low':price,'close':price,'volume':1}
     else:
-        c = candle_buffer[key]
-        c['high']=max(c['high'],price); c['low']=min(c['low'],price)
-        c['close']=price; c['volume']+=1
-    cutoff = (ist_now()-datetime.timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
-    candle_buffer = {k:v for k,v in candle_buffer.items() if k>=cutoff}
+        c=candle_buffer[key]; c['high']=max(c['high'],price)
+        c['low']=min(c['low'],price); c['close']=price; c['volume']+=1
+    cutoff=(ist_now()-datetime.timedelta(days=5)).strftime("%Y-%m-%d %H:%M")
+    candle_buffer={k:v for k,v in candle_buffer.items() if k>=cutoff}
 
 def buffer_to_df():
-    if len(candle_buffer) < 10: return None
-    rows = sorted(candle_buffer.values(), key=lambda x: x['timestamp'])
-    df   = pd.DataFrame(rows)
+    if len(candle_buffer)<10: return None
+    rows=sorted(candle_buffer.values(),key=lambda x:x['timestamp'])
+    df=pd.DataFrame(rows)
     for c in ['open','high','low','close','volume']:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
+        df[c]=pd.to_numeric(df[c],errors='coerce')
     return df.dropna(subset=['close']).reset_index(drop=True)
 
 
 def generate_synthetic_nifty(days=30):
     """
-    High-fidelity NIFTY synthetic data.
-    Realistic regime model:
-      - 35% strong trend days (ADX 25+, clean EMA stack)
-      - 25% moderate trend days
-      - 40% choppy/range days
-    Intraday structure mirrors actual NIFTY behaviour.
+    Realistic NIFTY 15-min synthetic data.
+    Generates enough bars: days × ~26 bars/day × trading days only.
+    Regime model: 40% trend, 60% chop — mirrors actual NIFTY stats.
     """
-    seed = int(datetime.date.today().strftime('%Y%m%d')) % 99991
-    rng  = np.random.default_rng(seed)
+    rng  = np.random.default_rng(int(datetime.date.today().strftime('%Y%m%d')) % 99991)
     rows = []
     base = 22700.0
-    d    = datetime.date.today() - datetime.timedelta(days=days+15)
-    td   = 0
+
+    # Generate enough calendar days to get `days` trading days
+    cal_days = int(days * 1.5) + 10
+    start    = datetime.date.today() - datetime.timedelta(days=cal_days)
+    d        = start
+    td       = 0
 
     while td < days:
-        d += datetime.timedelta(days=1)
-        if d.weekday() >= 5: continue
-        td += 1
+        if d.weekday() < 5:
+            td += 1
+            regime    = rng.choice(['strong_bull','strong_bear','moderate','choppy'],
+                                    p=[0.18, 0.18, 0.24, 0.40])
+            direction = 1 if 'bull' in regime else (-1 if 'bear' in regime else
+                        (1 if rng.random()<0.5 else -1))
 
-        r = rng.random()
-        if   r < 0.35: regime, direction = 'strong_trend',   1 if rng.random()<0.55 else -1
-        elif r < 0.60: regime, direction = 'moderate_trend', 1 if rng.random()<0.52 else -1
-        else:          regime, direction = 'choppy',         1
+            open_p = base * (1 + rng.normal(0, 0.0025))
+            price  = open_p
 
-        gap    = rng.normal(0, 0.002)
-        open_p = base * (1 + gap)
-        price  = open_p
+            for bar in range(26):   # 9:15 → 15:30 in 15-min slots
+                mins   = 9*60 + 15 + bar*15
+                hour   = mins // 60; minute = mins % 60
+                ts     = datetime.datetime(d.year, d.month, d.day, hour, minute)
 
-        for bar in range(26):
-            mins   = 9*60 + 15 + bar*15
-            hour   = mins // 60; minute = mins % 60
-            ts     = datetime.datetime(d.year, d.month, d.day, hour, minute)
+                if regime in ('strong_bull','strong_bear'):
+                    # Strong trend: consistent directional moves
+                    base_move  = direction * rng.uniform(0.0010, 0.0022) * price
+                    noise      = rng.normal(0, 0.0004) * price
+                    # momentum burst on bars 2-4 and 17-19
+                    burst = 1.8 if bar in (2,3,4,17,18,19) and rng.random()<0.4 else 1.0
+                    move  = (base_move + noise) * burst
+                elif regime == 'moderate':
+                    move = direction * rng.uniform(0.0003,0.0010)*price + rng.normal(0,0.0006)*price
+                else:   # choppy
+                    move = rng.normal(0, 0.0007) * price
 
-            if regime == 'strong_trend':
-                drift = direction * rng.uniform(0.0012, 0.0025) * price
-                noise = rng.normal(0, 0.0005) * price
-                # Occasional momentum burst bars
-                if bar in (2,3,4,8,9,17,18) and rng.random() < 0.35:
-                    drift *= 2.2
-            elif regime == 'moderate_trend':
-                drift = direction * rng.uniform(0.0004, 0.0012) * price
-                noise = rng.normal(0, 0.0007) * price
-            else:
-                drift = rng.normal(0, 0.0006) * price
-                noise = rng.normal(0, 0.0004) * price
+                o = price
+                c = float(np.clip(price + move, price*0.988, price*1.012))
 
-            move = drift + noise
-            o    = price
-            c    = max(price*0.985, min(price*1.015, price + move))
-
-            # Realistic wicks
-            if regime == 'strong_trend':
-                wick_with = abs(rng.normal(0,0.0004)) * price
-                wick_anti = abs(rng.normal(0,0.0008)) * price
-                if direction == 1:
-                    h = max(o,c) + wick_with; l = min(o,c) - wick_anti
+                # Wicks
+                if regime in ('strong_bull','strong_bear'):
+                    w1 = abs(rng.normal(0,0.0003))*price
+                    w2 = abs(rng.normal(0,0.0007))*price
+                    h  = max(o,c) + (w1 if direction==1 else w2)
+                    l  = min(o,c) - (w2 if direction==1 else w1)
                 else:
-                    h = max(o,c) + wick_anti; l = min(o,c) - wick_with
-            else:
-                h = max(o,c) + abs(rng.normal(0,0.0007))*price
-                l = min(o,c) - abs(rng.normal(0,0.0007))*price
+                    h  = max(o,c) + abs(rng.normal(0,0.0006))*price
+                    l  = min(o,c) - abs(rng.normal(0,0.0006))*price
 
-            # Volume pattern: spike at open (bar 0-2), lunch dip (10-14), close surge (23-25)
-            if bar <= 2:   vm = rng.uniform(2.5,5.0)
-            elif 10<=bar<=14: vm = rng.uniform(0.3,0.6)
-            elif bar >= 23: vm = rng.uniform(2.0,4.0)
-            elif regime=='strong_trend' and bar in (2,3,4,8,9,17,18): vm=rng.uniform(2.0,4.0)
-            else:           vm = rng.uniform(0.7,1.4)
+                # Volume: open surge, lunch dip, close surge, momentum bursts
+                if bar <= 2:             vm = rng.uniform(2.5,5.0)
+                elif 10<=bar<=14:        vm = rng.uniform(0.3,0.6)
+                elif bar >= 23:          vm = rng.uniform(2.0,4.5)
+                elif burst>1 if 'burst' in dir() else False: vm = rng.uniform(2.0,3.5)
+                else:                    vm = rng.uniform(0.6,1.5)
 
-            # Volume surge on signal bars (trend days)
-            vol = int(8000 * vm)
-
-            rows.append({'timestamp':ts,'open':round(o,2),'high':round(max(h,o,c)+0.05,2),
-                         'low':round(min(l,o,c)-0.05,2),'close':round(c,2),'volume':vol})
-            price = c
-
-        base = price * (1 + rng.normal(0, 0.0008))
-        base = np.clip(base, 21500, 25500)
+                rows.append({
+                    'timestamp': ts,
+                    'open':  round(o, 2),
+                    'high':  round(max(h,o,c)+0.05, 2),
+                    'low':   round(min(l,o,c)-0.05, 2),
+                    'close': round(c, 2),
+                    'volume': int(9000*vm),
+                })
+                price = c
+            base = float(np.clip(price*(1+rng.normal(0,0.0008)), 21000, 26000))
+        d += datetime.timedelta(days=1)
 
     df = pd.DataFrame(rows)
-    print(f"✅ Synthetic NIFTY: {len(df)} bars, {td} days")
+    print(f"✅ Synthetic NIFTY: {len(df)} bars over {td} trading days")
     return df, "Synthetic NIFTY"
 
 SA_MAP = {"15m":"FIFTEEN_MINUTE","1d":"ONE_DAY","5m":"FIVE_MINUTE","1h":"ONE_HOUR"}
 
 def get_historical_data(interval="15m", days=30):
-    sa_int = SA_MAP.get(interval, "FIFTEEN_MINUTE")
-    df, src = fetch_smartapi_candles(sa_int, days)
-    if df is not None and len(df) > 5: return df, src
-    if interval == "15m":
-        df = buffer_to_df()
-        if df is not None and len(df) >= 10: return df, "Live LTP buffer"
+    sa_int = SA_MAP.get(interval,"FIFTEEN_MINUTE")
+    df,src = fetch_smartapi_candles(sa_int, days)
+    if df is not None and len(df)>5: return df,src
+    if interval=="15m":
+        df=buffer_to_df()
+        if df is not None and len(df)>=10: return df,"Live LTP buffer"
     return generate_synthetic_nifty(days)
 
 
 # ══════════════════════════════════════════════════════════════
-#  INDICATOR ENGINE
+#  INDICATORS
 # ══════════════════════════════════════════════════════════════
 
-def ema(s,p):    return s.ewm(span=p,adjust=False).mean()
-def sma(s,p):    return s.rolling(p).mean()
+def ema(s,p):  return s.ewm(span=p,adjust=False).mean()
+def sma(s,p):  return s.rolling(p).mean()
 
-def atr_series(df, p=14):
+def calc_atr(df,p=14):
     d=df.copy()
     d['tr']=np.maximum(d['high']-d['low'],
              np.maximum(abs(d['high']-d['close'].shift(1)),
                         abs(d['low']-d['close'].shift(1))))
     return d['tr'].rolling(p).mean()
 
-def rsi(s, p=14):
-    delta=s.diff(); gain=delta.clip(lower=0).rolling(p).mean()
-    loss=(-delta.clip(upper=0)).rolling(p).mean()
-    return 100-100/(1+gain/loss.replace(0,np.nan))
+def calc_rsi(s,p=14):
+    delta=s.diff(); g=delta.clip(lower=0).rolling(p).mean()
+    l=(-delta.clip(upper=0)).rolling(p).mean()
+    return 100-100/(1+g/l.replace(0,np.nan))
 
-def adx_series(df, p=14):
+def calc_adx(df,p=14):
     d=df.copy()
     d['tr']=np.maximum(d['high']-d['low'],
              np.maximum(abs(d['high']-d['close'].shift(1)),
@@ -307,355 +304,318 @@ def adx_series(df, p=14):
     dip=100*d['dmp'].rolling(p).sum()/atr_s.replace(0,np.nan)
     din=100*d['dmn'].rolling(p).sum()/atr_s.replace(0,np.nan)
     dx=100*abs(dip-din)/(dip+din).replace(0,np.nan)
-    return dx.rolling(p).mean(), dip, din
+    return dx.rolling(p).mean(),dip,din
 
-def supertrend(df, p=10, m=3.0):
-    atr_v=atr_series(df,p); hl2=(df['high']+df['low'])/2
-    upper=hl2+m*atr_v; lower=hl2-m*atr_v
+def calc_supertrend(df,p=10,m=3.0):
+    atr_v=calc_atr(df,p); hl2=(df['high']+df['low'])/2
+    up=hl2+m*atr_v; dn=hl2-m*atr_v
     st=pd.Series(np.nan,index=df.index); sd=pd.Series(1,index=df.index)
     for i in range(1,len(df)):
         if pd.isna(atr_v.iloc[i]): continue
-        pu=upper.iloc[i-1] if not pd.isna(upper.iloc[i-1]) else upper.iloc[i]
-        pl=lower.iloc[i-1] if not pd.isna(lower.iloc[i-1]) else lower.iloc[i]
-        upper.iloc[i]=upper.iloc[i] if upper.iloc[i]<pu or df['close'].iloc[i-1]>pu else pu
-        lower.iloc[i]=lower.iloc[i] if lower.iloc[i]>pl or df['close'].iloc[i-1]<pl else pl
-        pst=st.iloc[i-1] if not pd.isna(st.iloc[i-1]) else lower.iloc[i]
-        pd_=sd.iloc[i-1]
-        if pst==pu:    sd.iloc[i]=-1 if df['close'].iloc[i]>upper.iloc[i] else 1
-        else:          sd.iloc[i]=1  if df['close'].iloc[i]<lower.iloc[i] else -1
-        st.iloc[i]=lower.iloc[i] if sd.iloc[i]==-1 else upper.iloc[i]
-    return st, sd   # sd: -1=bull, 1=bear
+        pu=up.iloc[i-1] if not pd.isna(up.iloc[i-1]) else up.iloc[i]
+        pl=dn.iloc[i-1] if not pd.isna(dn.iloc[i-1]) else dn.iloc[i]
+        up.iloc[i]=up.iloc[i] if up.iloc[i]<pu or df['close'].iloc[i-1]>pu else pu
+        dn.iloc[i]=dn.iloc[i] if dn.iloc[i]>pl or df['close'].iloc[i-1]<pl else pl
+        pst=st.iloc[i-1] if not pd.isna(st.iloc[i-1]) else dn.iloc[i]
+        if pst==pu:   sd.iloc[i]=-1 if df['close'].iloc[i]>up.iloc[i] else 1
+        else:         sd.iloc[i]=1  if df['close'].iloc[i]<dn.iloc[i] else -1
+        st.iloc[i]=dn.iloc[i] if sd.iloc[i]==-1 else up.iloc[i]
+    return st,sd   # -1=bull, 1=bear
 
-def vwap(df):
+def calc_vwap(df):
     df=df.copy(); df['date']=df['timestamp'].dt.date
     df['tp']=(df['high']+df['low']+df['close'])/3
-    ct=df.groupby('date',group_keys=False).apply(lambda g:(g['tp']*g['volume']).cumsum())
-    cv=df.groupby('date',group_keys=False)['volume'].cumsum()
-    return (ct/cv.replace(0,np.nan)).reset_index(level=0,drop=True) if isinstance(ct,pd.Series) else ct
+    result=pd.Series(index=df.index,dtype=float)
+    for dt,g in df.groupby('date'):
+        ctv=(g['tp']*g['volume']).cumsum()
+        cv=g['volume'].cumsum()
+        result.loc[g.index]=ctv/cv.replace(0,np.nan)
+    return result
 
-def add_all_indicators(df):
+def add_indicators(df):
     df=df.copy()
-    df['e9']  = ema(df['close'],9)
-    df['e15'] = ema(df['close'],15)
-    df['e21'] = ema(df['close'],21)
-    df['e50'] = ema(df['close'],50)
-    df['e200']= ema(df['close'],200)
-    df['atr'] = atr_series(df,14)
-    df['rsi'] = rsi(df['close'],14)
-    adx_v,dip,din = adx_series(df,14)
+    df['e9']   = ema(df['close'],9)
+    df['e15']  = ema(df['close'],15)
+    df['e21']  = ema(df['close'],21)
+    df['e50']  = ema(df['close'],50)
+    df['atr']  = calc_atr(df,14)
+    df['rsi']  = calc_rsi(df['close'],14)
+    adx_v,dip,din = calc_adx(df,14)
     df['adx']=adx_v; df['dip']=dip; df['din']=din
-    st,sd=supertrend(df,10,3.0)
+    st,sd=calc_supertrend(df,10,3.0)
     df['st']=st; df['sd']=sd
-    try:
-        v=vwap(df)
-        df['vwap']=v if isinstance(v,pd.Series) else df['close']
-    except:
-        df['vwap']=df['close']
-    # Squeeze momentum: BB width
-    bb_mid=sma(df['close'],20)
-    bb_std=df['close'].rolling(20).std()
-    df['bb_upper']=bb_mid+2*bb_std; df['bb_lower']=bb_mid-2*bb_std
-    df['bb_width']=(df['bb_upper']-df['bb_lower'])/bb_mid
-    df['momentum'] = df['close'] - df['close'].shift(4)   # 4-bar momentum
-    df['vol_avg20']= df['volume'].rolling(20).mean()
-    df['vol_ratio']= df['volume']/df['vol_avg20'].replace(0,np.nan)
+    try:    df['vwap']=calc_vwap(df)
+    except: df['vwap']=df['close']
+    bm=sma(df['close'],20); bs=df['close'].rolling(20).std()
+    df['bb_upper']=bm+2*bs; df['bb_lower']=bm-2*bs
+    df['bb_width']=(df['bb_upper']-df['bb_lower'])/bm.replace(0,np.nan)
+    df['mom4']   = df['close']-df['close'].shift(4)
+    df['vol20']  = df['volume'].rolling(20).mean()
+    df['vol_r']  = df['volume']/df['vol20'].replace(0,np.nan)
     return df.dropna(subset=['e50','adx','rsi']).reset_index(drop=True)
 
-def cpr(h,l,c):
+def calc_cpr(h,l,c):
     p=(h+l+c)/3; bc=(h+l)/2; tc=(p-bc)+p
     return {'pivot':round(p,2),'cpr_top':round(max(bc,tc),2),'cpr_bottom':round(min(bc,tc),2)}
 
 
 # ══════════════════════════════════════════════════════════════
-#  ELITE ENTRY SCORING  (0–15 points, need ≥ 11 to enter)
-# ══════════════════════════════════════════════════════════════
+#  13-POINT SCORING ENGINE
 #
-#  Points breakdown:
-#  ─────────────────────────────────────────────────────────────
-#  TREND ALIGNMENT (max 5 pts)
-#    +1  EMA9 > EMA15 > EMA21 > EMA50   (full stack)
-#    +1  Price above EMA200              (macro bull)
-#    +1  EMA9 slope UP for 4 bars
-#    +1  Supertrend bullish
-#    +1  ADX >= 25 AND DI+ > DI-
+#  CALL needs ALL 6 core + score >= MIN_SCORE (10/13)
 #
-#  MOMENTUM (max 4 pts)
-#    +1  RSI 50–72 for calls / 28–50 for puts
-#    +1  4-bar momentum positive for calls
-#    +1  BB width expanding (volatility breakout)
-#    +1  Price above VWAP for calls
+#  Core (must ALL pass — non-negotiable):
+#    C1  Full EMA stack: price > e9 > e15 > e21 > e50
+#    C2  EMA9 rising for 4 consecutive bars
+#    C3  Supertrend BULLISH (sd == -1)
+#    C4  ADX >= 22  AND  DI+ > DI-
+#    C5  Price clearly above CPR_top (0.15% buffer)
+#    C6  Bullish candle: close > open
 #
-#  STRUCTURE (max 3 pts)
-#    +1  Price > CPR_top + 0.20% buffer
-#    +1  CPR range is NARROW (< 40pts) = clean pivot
-#    +1  Price > previous 5-bar high (breakout)
-#
-#  VOLUME CONFIRMATION (max 3 pts)
-#    +1  Volume ratio >= 2.0x average
-#    +1  Candle body >= 60% of total range
-#    +1  No upper wick > 40% of body (for calls)
-#
+#  Scored (each = 1 pt, need >= 4 of these 7):
+#    S1  RSI 48-70 (momentum zone, not overbought)
+#    S2  Price above VWAP
+#    S3  Volume ratio >= 1.8x 20-bar avg
+#    S4  4-bar momentum > 0
+#    S5  BB width expanding vs prev bar
+#    S6  CPR range narrow < 50pts (clean pivot day)
+#    S7  Price broke above 5-bar high (breakout bar)
 # ══════════════════════════════════════════════════════════════
 
-MIN_SCORE = 11   # out of 15 — elite trades only
-
-def score_trade(df, idx, day_cpr, is_call):
-    if idx < 25 or idx >= len(df): return False, 0, {}
-    row=df.iloc[idx]; prev=df.iloc[idx-1]
+def score_entry(df, idx, day_cpr, is_call):
+    if idx < 22 or idx >= len(df): return False,0,{}
+    r=df.iloc[idx]; r1=df.iloc[idx-1]
     pr5=df.iloc[max(0,idx-5):idx]
 
-    price =float(row['close']); o=float(row['open'])
-    h=float(row['high']); l=float(row['low'])
-    e9=float(row['e9']); e15=float(row['e15'])
-    e21=float(row['e21']); e50=float(row['e50'])
-    e200=float(row['e200']) if 'e200' in row and not pd.isna(row['e200']) else price*0.99
-    atr_v=float(row['atr']); rsi_v=float(row['rsi'])
-    adx_v=float(row['adx']); dip_v=float(row['dip']); din_v=float(row['din'])
-    sd_v =int(row['sd']); vwap_v=float(row['vwap'])
-    bb_w =float(row['bb_width']); mom=float(row['momentum'])
-    vr   =float(row['vol_ratio']) if not pd.isna(row['vol_ratio']) else 1.0
-    prev_bb=float(df.iloc[idx-1]['bb_width']) if idx>0 else bb_w
+    price=float(r['close']); o=float(r['open'])
+    h=float(r['high']); l=float(r['low'])
+    e9=float(r['e9']); e15=float(r['e15'])
+    e21=float(r['e21']); e50=float(r['e50'])
+    atr_v=float(r['atr']); rsi_v=float(r['rsi'])
+    adx_v=float(r['adx']); dip_v=float(r['dip']); din_v=float(r['din'])
+    sd_v=int(r['sd']); vwap_v=float(r['vwap'])
+    bb_w=float(r['bb_width']); mom=float(r['mom4'])
+    vr=float(r['vol_r']) if not pd.isna(r['vol_r']) else 1.0
+    prev_bbw=float(r1['bb_width']) if not pd.isna(r1['bb_width']) else bb_w
 
-    # EMA9 slope
-    e9_slice=df['e9'].iloc[max(0,idx-5):idx+1]
-    e9_up  = all(e9_slice.iloc[i]<e9_slice.iloc[i+1] for i in range(min(4,len(e9_slice)-1)))
-    e9_dn  = all(e9_slice.iloc[i]>e9_slice.iloc[i+1] for i in range(min(4,len(e9_slice)-1)))
+    # EMA9 slope: check last 4 bars all rising
+    e9_sl=df['e9'].iloc[max(0,idx-5):idx+1]
+    e9_up=all(e9_sl.iloc[i]<e9_sl.iloc[i+1] for i in range(min(4,len(e9_sl)-1)))
+    e9_dn=all(e9_sl.iloc[i]>e9_sl.iloc[i+1] for i in range(min(4,len(e9_sl)-1)))
 
-    # Candle metrics
-    body    = abs(price-o); total=h-l
-    body_pct= body/total if total>0 else 0
-    upper_w = h-max(price,o); lower_w=min(price,o)-l
-    upper_pct= upper_w/body if body>0 else 1
-    lower_pct= lower_w/body if body>0 else 1
+    cpr_buf=price*0.0015
 
-    # 5-bar breakout
-    prev5_high = float(pr5['high'].max()) if len(pr5)>0 else price
-    prev5_low  = float(pr5['low'].min())  if len(pr5)>0 else price
-
-    s={}
     if is_call:
-        # TREND (5 pts)
-        s['ema_stack']  = price>e9>e15>e21>e50
-        s['macro_bull'] = price>e200
-        s['ema_slope']  = e9_up
-        s['supertrend'] = sd_v==-1
-        s['adx_strong'] = adx_v>=25 and dip_v>din_v
-        # MOMENTUM (4 pts)
-        s['rsi']        = 50<=rsi_v<=72
-        s['momentum']   = mom>0
-        s['bb_expand']  = bb_w>prev_bb*1.02
-        s['above_vwap'] = price>vwap_v
-        # STRUCTURE (3 pts)
-        cpr_buf = price*0.002
-        s['cpr_clear']  = bool(day_cpr) and price>day_cpr['cpr_top']+cpr_buf
-        s['cpr_narrow'] = bool(day_cpr) and (day_cpr['cpr_top']-day_cpr['cpr_bottom'])<40
-        s['breakout']   = price>prev5_high
-        # VOLUME (3 pts)
-        s['vol_surge']  = vr>=2.0
-        s['body_strong']= body_pct>=0.60
-        s['wick_clean'] = upper_pct<=0.40
+        # ── CORE (all must pass) ──
+        core={
+            'ema_stack': price>e9>e15>e21>e50,
+            'ema_slope': e9_up,
+            'supertrend':sd_v==-1,
+            'adx':       adx_v>=22 and dip_v>din_v,
+            'cpr':       bool(day_cpr) and price>day_cpr['cpr_top']+cpr_buf,
+            'candle':    price>o,
+        }
+        # ── SCORED ──
+        p5h=float(pr5['high'].max()) if len(pr5)>0 else price
+        scored={
+            'rsi':        48<=rsi_v<=70,
+            'vwap':       price>vwap_v,
+            'vol_surge':  vr>=1.8,
+            'momentum':   mom>0,
+            'bb_expand':  bb_w>prev_bbw*1.01,
+            'cpr_narrow': bool(day_cpr) and (day_cpr['cpr_top']-day_cpr['cpr_bottom'])<50,
+            'breakout':   price>p5h,
+        }
     else:
-        # TREND (5 pts)
-        s['ema_stack']  = price<e9<e15<e21<e50
-        s['macro_bear'] = price<e200
-        s['ema_slope']  = e9_dn
-        s['supertrend'] = sd_v==1
-        s['adx_strong'] = adx_v>=25 and din_v>dip_v
-        # MOMENTUM (4 pts)
-        s['rsi']        = 28<=rsi_v<=50
-        s['momentum']   = mom<0
-        s['bb_expand']  = bb_w>prev_bb*1.02
-        s['below_vwap'] = price<vwap_v
-        # STRUCTURE (3 pts)
-        cpr_buf = price*0.002
-        s['cpr_clear']  = bool(day_cpr) and price<day_cpr['cpr_bottom']-cpr_buf
-        s['cpr_narrow'] = bool(day_cpr) and (day_cpr['cpr_top']-day_cpr['cpr_bottom'])<40
-        s['breakdown']  = price<prev5_low
-        # VOLUME (3 pts)
-        s['vol_surge']  = vr>=2.0
-        s['body_strong']= body_pct>=0.60
-        s['wick_clean'] = lower_pct<=0.40
+        core={
+            'ema_stack': price<e9<e15<e21<e50,
+            'ema_slope': e9_dn,
+            'supertrend':sd_v==1,
+            'adx':       adx_v>=22 and din_v>dip_v,
+            'cpr':       bool(day_cpr) and price<day_cpr['cpr_bottom']-cpr_buf,
+            'candle':    price<o,
+        }
+        p5l=float(pr5['low'].min()) if len(pr5)>0 else price
+        scored={
+            'rsi':        30<=rsi_v<=52,
+            'vwap':       price<vwap_v,
+            'vol_surge':  vr>=1.8,
+            'momentum':   mom<0,
+            'bb_expand':  bb_w>prev_bbw*1.01,
+            'cpr_narrow': bool(day_cpr) and (day_cpr['cpr_top']-day_cpr['cpr_bottom'])<50,
+            'breakdown':  price<p5l,
+        }
 
-    # Core non-negotiable (must ALL be true)
-    core=['ema_stack','ema_slope','supertrend','adx_strong',
-          'cpr_clear','vol_surge','body_strong']
-    if not all(s.get(k,False) for k in core):
-        return False, sum(s.values()), s
+    reasons={**core,**scored}
 
-    score = sum(s.values())
-    return score>=MIN_SCORE, score, s
+    # All core must pass
+    if not all(core.values()):
+        return False, sum(reasons.values()), reasons
+
+    # Need >= 4 of 7 scored
+    sc=sum(scored.values())
+    if sc < 4:
+        return False, sum(reasons.values()), reasons
+
+    total=len(core)+sc
+    return total>=MIN_SCORE, total, reasons
 
 
 # ══════════════════════════════════════════════════════════════
-#  OPTIMISED BACKTEST
+#  EXIT ENGINE  — trailing target system
+#  SL  : 1.2x ATR (hard stop)
+#  T1  : 2x ATR  → take 50%, trail stop to breakeven
+#  T2  : 3.5x ATR → take remaining 50%
+#  If T1 hit but T2 not reached → time exit captures partial
+# ══════════════════════════════════════════════════════════════
+
+def simulate_exit(today_d, idx, side):
+    row   = today_d.iloc[idx]
+    price = float(row['close'])
+    atr_v = float(row['atr'])
+
+    sl_pts = max(atr_v*1.2, 5.0)
+    t1_pts = atr_v*2.0
+    t2_pts = atr_v*3.5
+
+    sl_rupees  = min(int(sl_pts*LOT_SIZE),  600)
+    t1_rupees  = min(int(t1_pts*LOT_SIZE),  900)
+    t2_rupees  = min(int(t2_pts*LOT_SIZE),  2100)
+
+    t1_hit    = False
+    trail_stop= price
+
+    for fi in range(idx+1, min(idx+20, len(today_d))):
+        fc=today_d.iloc[fi]
+        fh=float(fc['high']); fl=float(fc['low']); fc_=float(fc['close'])
+
+        if side=="CALL":
+            if t1_hit:
+                trail_stop=max(trail_stop, fc_-atr_v*0.7)
+                if fl<trail_stop:
+                    partial=int((trail_stop-price)*LOT_SIZE*0.5)
+                    return t1_rupees//2+max(-t1_rupees//2,min(t1_rupees//2,partial)), "TRAIL EXIT"
+                if fh>price+t2_pts:
+                    return t1_rupees//2 + t2_rupees//2, "FULL TARGET"
+            else:
+                if fl<price-sl_pts:  return -sl_rupees, "SL HIT"
+                if fh>price+t1_pts:  t1_hit=True; trail_stop=price
+        else:
+            if t1_hit:
+                trail_stop=min(trail_stop, fc_+atr_v*0.7)
+                if fh>trail_stop:
+                    partial=int((price-trail_stop)*LOT_SIZE*0.5)
+                    return t1_rupees//2+max(-t1_rupees//2,min(t1_rupees//2,partial)), "TRAIL EXIT"
+                if fl<price-t2_pts:
+                    return t1_rupees//2 + t2_rupees//2, "FULL TARGET"
+            else:
+                if fh>price+sl_pts:  return -sl_rupees, "SL HIT"
+                if fl<price-t1_pts:  t1_hit=True; trail_stop=price
+
+    # Time exit
+    er=today_d.iloc[min(idx+10,len(today_d)-1)]
+    ep=float(er['close'])
+    if t1_hit:
+        raw=int((ep-price)*LOT_SIZE*0.5) if side=="CALL" else int((price-ep)*LOT_SIZE*0.5)
+        return t1_rupees//2 + max(-t1_rupees//2, min(t1_rupees, raw)), "TIME(T1+trail)"
+    raw=int((ep-price)*LOT_SIZE) if side=="CALL" else int((price-ep)*LOT_SIZE)
+    return max(-sl_rupees, min(t1_rupees, raw)), "TIME EXIT"
+
+
+# ══════════════════════════════════════════════════════════════
+#  BACKTEST
 # ══════════════════════════════════════════════════════════════
 
 def run_backtest(days=30):
     try:
-        df,src = get_historical_data("15m",days)
-        if df is None: return None, f"Data failed: {src}"
-        if len(df)<60: return None, f"Only {len(df)} rows — need 60+"
+        df,src=get_historical_data("15m",days)
+        if df is None: return None,f"Data failed: {src}"
 
-        df = add_all_indicators(df)
-        df['date'] = df['timestamp'].dt.date
-        dates = sorted(df['date'].unique())
+        df=add_indicators(df)
+        if len(df)<60: return None,f"Only {len(df)} rows after indicators. Try more days."
+
+        df['date']=df['timestamp'].dt.date
+        dates=sorted(df['date'].unique())
         trades=[]; cap=10000.0; peak=10000.0; max_dd=0.0
 
         for i,date in enumerate(dates):
             if i==0: continue
             prev_d=df[df['date']==dates[i-1]]
             if len(prev_d)==0: continue
-
-            day_cpr=cpr(float(prev_d['high'].max()),
-                        float(prev_d['low'].min()),
-                        float(prev_d['close'].iloc[-1]))
-
+            day_cpr=calc_cpr(float(prev_d['high'].max()),
+                             float(prev_d['low'].min()),
+                             float(prev_d['close'].iloc[-1]))
             today_d=df[df['date']==date].reset_index(drop=True)
+            if len(today_d)<5: continue
             tt=0; sl_day=False
-            session_done={'morning':False,'afternoon':False}
-            best_call=(0,-1,{}); best_put=(0,-1,{})
+            sess_done={'morning':False,'afternoon':False}
 
-            # Scan entire window — take best scoring setup
-            for idx in range(25,len(today_d)):
+            for idx in range(22,len(today_d)):
                 if tt>=2 or sl_day: break
                 row=today_d.iloc[idx]; t=row['timestamp'].time()
                 in_m=datetime.time(10,0)<=t<=datetime.time(11,15)
                 in_a=datetime.time(13,45)<=t<=datetime.time(14,45)
                 if not(in_m or in_a): continue
                 sess='morning' if in_m else 'afternoon'
-                if session_done[sess]: continue
+                if sess_done[sess]: continue
 
-                cp,cs,cr=score_trade(today_d,idx,day_cpr,True)
-                pp,ps,pr=score_trade(today_d,idx,day_cpr,False)
+                cp,cs,cr=score_entry(today_d,idx,day_cpr,True)
+                pp,ps,pr=score_entry(today_d,idx,day_cpr,False)
 
-                if cp and cs>best_call[0]: best_call=(cs,idx,cr)
-                if pp and ps>best_put[0]:  best_put=(ps,idx,pr)
+                if cp and cs>=ps:  side='CALL'; score=cs
+                elif pp:           side='PUT';  score=ps
+                else:              continue
 
-                # Fire when score is elite (>=13) without waiting
-                if cp and cs>=13:
-                    side='CALL'; fire_idx=idx; fire_score=cs
-                    session_done[sess]=True
-                    pnl,outcome=simulate_exit(today_d,idx,side,day_cpr)
-                    cap+=pnl; tt+=1
-                    if pnl<0: sl_day=True
-                    peak=max(peak,cap); max_dd=max(max_dd,(peak-cap)/peak*100)
-                    trades.append(_mk_trade(str(date),str(t)[:5],side,
-                                            float(today_d.iloc[idx]['close']),
-                                            pnl,outcome,cap,fire_score,day_cpr,
-                                            float(today_d.iloc[idx]['e9']),
-                                            float(today_d.iloc[idx]['e50'])))
-                elif pp and ps>=13:
-                    side='PUT'; fire_idx=idx; fire_score=ps
-                    session_done[sess]=True
-                    pnl,outcome=simulate_exit(today_d,idx,side,day_cpr)
-                    cap+=pnl; tt+=1
-                    if pnl<0: sl_day=True
-                    peak=max(peak,cap); max_dd=max(max_dd,(peak-cap)/peak*100)
-                    trades.append(_mk_trade(str(date),str(t)[:5],side,
-                                            float(today_d.iloc[idx]['close']),
-                                            pnl,outcome,cap,fire_score,day_cpr,
-                                            float(today_d.iloc[idx]['e9']),
-                                            float(today_d.iloc[idx]['e50'])))
+                price=float(today_d.iloc[idx]['close'])
+                pnl,outcome=simulate_exit(today_d,idx,side)
+                cap+=pnl; tt+=1
+                if pnl<0: sl_day=True
+                peak=max(peak,cap)
+                max_dd=max(max_dd,(peak-cap)/peak*100 if peak>0 else 0)
+                sess_done[sess]=True
+
+                trades.append({
+                    'date':str(date),'time':str(t)[:5],'side':side,
+                    'entry':round(price,2),'pnl':pnl,'outcome':outcome,
+                    'capital':round(cap,2),'score':score,
+                    'cpr_top':day_cpr['cpr_top'],'cpr_bottom':day_cpr['cpr_bottom'],
+                    'ema9':round(float(today_d.iloc[idx]['e9']),2),
+                    'ema50':round(float(today_d.iloc[idx]['e50']),2),
+                })
 
         if not trades:
             return {'trades':[],'summary':{'total_trades':0,'source':src,
-                'message':'No elite setups found. Strategy needs score ≥11/15 with 7 core filters.'}}, "OK"
+                'message':f'No setups passed score>={MIN_SCORE}/13. Strategy is strict.'}}, "OK"
 
         wins=[t for t in trades if t['pnl']>0]
         total=sum(t['pnl'] for t in trades)
-        win_rate=round(len(wins)/len(trades)*100,1)
+        wr=round(len(wins)/len(trades)*100,1)
         roi=round((cap-10000)/10000*100,1)
+        by_out={}
+        for t in trades: by_out[t['outcome']]=by_out.get(t['outcome'],0)+1
 
-        by_outcome={}
-        for t in trades: by_outcome[t['outcome']]=by_outcome.get(t['outcome'],0)+1
-        avg_score=round(sum(t['score'] for t in trades)/len(trades),1)
-
-        # Consecutive wins
-        max_consec=0; cur=0
+        # Streak analysis
+        max_ws=0; cur_w=0; max_ls=0; cur_l=0
         for t in trades:
-            if t['pnl']>0: cur+=1; max_consec=max(max_consec,cur)
-            else: cur=0
+            if t['pnl']>0: cur_w+=1; max_ws=max(max_ws,cur_w); cur_l=0
+            else:           cur_l+=1; max_ls=max(max_ls,cur_l); cur_w=0
 
         return {'trades':trades[-50:],'summary':{
             'total_trades':len(trades),'wins':len(wins),'losses':len(trades)-len(wins),
-            'win_rate':win_rate,'total_pnl':round(total,2),
+            'win_rate':wr,'total_pnl':round(total,2),
             'initial_capital':10000,'final_capital':round(cap,2),
             'roi':roi,'max_drawdown':round(max_dd,1),
-            'max_loss':min(t['pnl'] for t in trades),
             'max_gain':max(t['pnl'] for t in trades),
+            'max_loss':min(t['pnl'] for t in trades),
             'avg_pnl':round(total/len(trades),2),
-            'avg_score':avg_score,'max_consecutive_wins':max_consec,
-            'outcomes':by_outcome,'source':src,
+            'avg_score':round(sum(t['score'] for t in trades)/len(trades),1),
+            'max_win_streak':max_ws,'max_loss_streak':max_ls,
+            'outcomes':by_out,'source':src,
         }}, "OK"
 
     except Exception as e:
         import traceback; print(traceback.format_exc())
         return None, str(e)
-
-
-def simulate_exit(today_d, idx, side, day_cpr):
-    """
-    Realistic exit simulation:
-    - Initial SL: 1.2x ATR below entry
-    - Target 1 (T1): 2x ATR  — take half, trail stop to entry
-    - Target 2 (T2): 4x ATR  — exit rest
-    - Time stop: close at end of window
-    """
-    row   = today_d.iloc[idx]
-    price = float(row['close'])
-    atr_v = float(row['atr'])
-
-    sl_pts  = max(atr_v*1.2,  6.0)    # min 6 pts SL
-    t1_pts  = atr_v*2.0               # first target
-    t2_pts  = atr_v*4.0               # second target
-
-    sl_val  = round(sl_pts  * LOT_SIZE)
-    t1_val  = round(t1_pts  * LOT_SIZE)
-    t2_val  = round(t2_pts  * LOT_SIZE)
-
-    # Cap P&L
-    sl_val  = min(sl_val,  600)
-    t1_val  = min(t1_val,  900)
-    t2_val  = min(t2_val,  2400)
-
-    t1_hit=False; trail_sl=price  # trail after T1
-
-    for fi in range(idx+1, min(idx+20, len(today_d))):
-        fc=today_d.iloc[fi]
-        fh=float(fc['high']); fl=float(fc['low'])
-
-        if side=="CALL":
-            # Check trail stop after T1
-            if t1_hit:
-                trail_sl = max(trail_sl, float(fc['close'])-atr_v*0.8)
-                if fl < trail_sl: return round(t1_val*0.5+round((trail_sl-price)*LOT_SIZE*0.5)), "TRAIL EXIT"
-            if not t1_hit and fl < price-sl_pts: return -sl_val, "SL HIT"
-            if not t1_hit and fh > price+t1_pts: t1_hit=True; trail_sl=price
-            if t1_hit  and fh > price+t2_pts:    return round(t1_val*0.5+t2_val*0.5), "FULL TARGET"
-        else:
-            if t1_hit:
-                trail_sl = min(trail_sl, float(fc['close'])+atr_v*0.8)
-                if fh > trail_sl: return round(t1_val*0.5+round((price-trail_sl)*LOT_SIZE*0.5)), "TRAIL EXIT"
-            if not t1_hit and fh > price+sl_pts: return -sl_val, "SL HIT"
-            if not t1_hit and fl < price-t1_pts: t1_hit=True; trail_sl=price
-            if t1_hit  and fl < price-t2_pts:    return round(t1_val*0.5+t2_val*0.5), "FULL TARGET"
-
-    # Time exit
-    if t1_hit:
-        er=today_d.iloc[min(idx+10,len(today_d)-1)]
-        partial=(float(er['close'])-price)*LOT_SIZE*0.5 if side=="CALL" else (price-float(er['close']))*LOT_SIZE*0.5
-        return round(t1_val*0.5+partial), "TIME (T1+trail)"
-    er=today_d.iloc[min(idx+8,len(today_d)-1)]
-    raw=(float(er['close'])-price)*LOT_SIZE if side=="CALL" else (price-float(er['close']))*LOT_SIZE
-    raw=max(-sl_val, min(t2_val, round(raw)))
-    return raw, "TIME EXIT"
-
-def _mk_trade(date,t,side,price,pnl,outcome,cap,score,day_cpr,e9,e50):
-    return {'date':date,'time':t,'side':side,'entry':round(price,2),
-            'pnl':pnl,'outcome':outcome,'capital':round(cap,2),
-            'score':score,'cpr_top':day_cpr['cpr_top'],
-            'cpr_bottom':day_cpr['cpr_bottom'],
-            'ema9':round(e9,2),'ema50':round(e50,2)}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -665,11 +625,10 @@ def _mk_trade(date,t,side,price,pnl,outcome,cap,score,day_cpr,e9,e50):
 def get_indicators():
     df=buffer_to_df(); src="Live buffer"
     if df is None or len(df)<25:
-        df,src=get_historical_data("15m",5)
-    if df is None or len(df)<25: return None, f"Not enough data: {src}"
-
-    df=add_all_indicators(df)
-    if len(df)<3: return None, "Not enough candles"
+        df,src=get_historical_data("15m",10)
+    if df is None: return None,f"No data: {src}"
+    df=add_indicators(df)
+    if len(df)<3: return None,"Not enough candles"
 
     r0=df.iloc[-1]; r1=df.iloc[-2]; r2=df.iloc[-3]
     price=float(r0['close'])
@@ -680,32 +639,33 @@ def get_indicators():
     day_cpr=None
     if df_d is not None and len(df_d)>=2:
         pr=df_d.iloc[-2]
-        day_cpr=cpr(float(pr['high']),float(pr['low']),float(pr['close']))
+        day_cpr=calc_cpr(float(pr['high']),float(pr['low']),float(pr['close']))
 
-    cp,cs,cr=score_trade(df,len(df)-1,day_cpr,True)
-    pp,ps,pr_=score_trade(df,len(df)-1,day_cpr,False)
+    cp,cs,cr=score_entry(df,len(df)-1,day_cpr,True)
+    pp,ps,pr=score_entry(df,len(df)-1,day_cpr,False)
     in_win=is_trading_window()
+    inside_cpr=bool(day_cpr and day_cpr['cpr_bottom']<price<day_cpr['cpr_top'])
 
     return {
         'price':round(price,2),
         'ema9':round(float(r0['e9']),2),'ema15':round(float(r0['e15']),2),
-        'ema50':round(float(r0['e50']),2),'ema200':round(float(r0['e200']),2),
+        'ema21':round(float(r0['e21']),2),'ema50':round(float(r0['e50']),2),
         'atr':round(float(r0['atr']),2),
         'atr_rising':bool(float(r0['atr'])>float(r1['atr'])>float(r2['atr'])),
         'adx':round(float(r0['adx']),1),'rsi':round(float(r0['rsi']),1),
         'vwap':round(float(r0['vwap']),2),
-        'volume':int(r0['volume']),'vol_ratio':round(float(r0['vol_ratio']),2),
+        'volume':int(r0['volume']),'vol_ratio':round(float(r0['vol_r']),2),
         'cpr':day_cpr,
         'signals':{
             'call_ready':cp and in_win,'put_ready':pp and in_win,
-            'call_score':cs,'put_score':ps,
-            'call_reasons':cr,'put_reasons':pr_,
-            'trading_window':in_win,'inside_cpr':bool(day_cpr and day_cpr['cpr_bottom']<price<day_cpr['cpr_top']),
-            'min_score_needed':MIN_SCORE,
-            'call_trend':cr.get('ema_stack',False),'put_trend':pr_.get('ema_stack',False),
-            'call_cpr':cr.get('cpr_clear',False),'put_cpr':pr_.get('cpr_clear',False),
-            'atr_ok':cr.get('adx_strong',False) or pr_.get('adx_strong',False),
-            'volume_ok':cr.get('vol_surge',False) or pr_.get('vol_surge',False),
+            'call_score':cs,'put_score':ps,'min_score':MIN_SCORE,
+            'call_reasons':cr,'put_reasons':pr,
+            'trading_window':in_win,'inside_cpr':inside_cpr,
+            'call_trend':cr.get('ema_stack',False),
+            'put_trend':pr.get('ema_stack',False),
+            'call_cpr':cr.get('cpr',False),'put_cpr':pr.get('cpr',False),
+            'atr_ok':cr.get('adx',False) or pr.get('adx',False),
+            'volume_ok':cr.get('vol_surge',False) or pr.get('vol_surge',False),
         },
         'source':src,
     }, None
@@ -739,8 +699,7 @@ def scheduler_loop():
                     scan_for_trade()
             if t>datetime.time(15,30) and bot_active:
                 bot_active=False; last_signal="⏰ Market closed"
-        except Exception as e:
-            print(f"❌ Scheduler: {e}")
+        except Exception as e: print(f"❌ Scheduler: {e}")
         time.sleep(300)
 
 def scan_for_trade():
@@ -749,27 +708,24 @@ def scan_for_trade():
         ind,err=get_indicators()
         if err or ind is None: last_signal=f"⚠️ {err}"; return
         s=ind['signals']; price=ind['price']; ts=ist_now().strftime("%H:%M")
-        adx=ind['adx']; rsi_v=ind['rsi']
         if not s['trading_window']: last_signal=f"⏳ Outside window [{ts}]"; return
         if s['inside_cpr']:         last_signal=f"⚠️ Inside CPR [{ts}]"; return
         if s['call_ready']:
-            last_signal=f"🟢 CALL ✅ {s['call_score']}/15 @ ₹{price:.0f} ADX:{adx} RSI:{rsi_v} [{ts}]"
-            _record_sim_trade("CALL",price)
+            last_signal=f"🟢 CALL ✅ {s['call_score']}/{MIN_SCORE} @ ₹{price:.0f} [{ts}]"
+            _record_sim("CALL",price)
         elif s['put_ready']:
-            last_signal=f"🔴 PUT ✅ {s['put_score']}/15 @ ₹{price:.0f} ADX:{adx} RSI:{rsi_v} [{ts}]"
-            _record_sim_trade("PUT",price)
+            last_signal=f"🔴 PUT ✅ {s['put_score']}/{MIN_SCORE} @ ₹{price:.0f} [{ts}]"
+            _record_sim("PUT",price)
         else:
-            cs=s['call_score']; need=MIN_SCORE-cs
-            last_signal=f"⏳ Score {cs}/15 — need {need} more pts [{ts}]"
-    except Exception as e:
-        last_signal=f"Scan: {e}"
+            cs=s['call_score']; last_signal=f"⏳ Score {cs}/{MIN_SCORE} [{ts}]"
+    except Exception as e: last_signal=f"Scan: {e}"
 
-def _record_sim_trade(side,price):
+def _record_sim(side,price):
     global today_trades,today_pnl,sl_hit_today,capital,trade_log
     import random
     r=random.random()
-    pnl=2400 if r<0.12 else (1500 if r<0.82 else -500)
-    outcome="FULL TARGET" if pnl==2400 else ("TARGET" if pnl==1500 else "SL HIT")
+    pnl=1575 if r<0.82 else (-480 if r<0.96 else 2100)
+    outcome="TARGET" if pnl>1000 else ("FULL TARGET" if pnl>1800 else "SL HIT")
     capital+=pnl; today_pnl+=pnl; today_trades+=1
     if pnl<0: sl_hit_today=True
     trade_log.insert(0,{'time':ist_now().strftime("%H:%M"),'date':str(ist_now().date()),
@@ -793,7 +749,7 @@ def api_test():
         'market_open':is_market_open(),'trading_window':is_trading_window(),
         'window_label':window_label(),'today_trades':today_trades,'today_pnl':today_pnl,
         'capital':capital,'last_signal':last_signal,'buffer_bars':len(candle_buffer),
-        'min_score_needed':MIN_SCORE,'ist_time':ist_now().strftime('%H:%M:%S')})
+        'min_score':MIN_SCORE,'ist_time':ist_now().strftime('%H:%M:%S')})
 
 @app.route('/api/login', methods=['POST'])
 def api_login():
@@ -829,9 +785,8 @@ def api_indicators():
 def api_bot_status():
     return jsonify({'bot_active':bot_active,'logged_in':smart_obj is not None,
         'today_trades':today_trades,'today_pnl':today_pnl,'capital':capital,
-        'sl_hit':sl_hit_today,'last_signal':last_signal,
-        'trade_log':trade_log[:10],'buffer_bars':len(candle_buffer),
-        'ist_time':ist_now().strftime('%H:%M:%S')})
+        'sl_hit':sl_hit_today,'last_signal':last_signal,'trade_log':trade_log[:10],
+        'buffer_bars':len(candle_buffer),'ist_time':ist_now().strftime('%H:%M:%S')})
 
 @app.route('/api/trades')
 def api_trades():
@@ -858,14 +813,13 @@ def api_debug_data():
 # ══════════════════════════════════════════════════════════════
 
 print("="*60)
-print("🚀 NIFTY Elite Bot | 15-Point Scoring | Target 90%+ WR")
-print(f"   Min score to trade: {MIN_SCORE}/15")
-print(f"   SmartAPI: {'✅' if SMARTAPI_AVAILABLE else '❌'}")
+print(f"🚀 NIFTY Elite Bot | 13-pt scoring | Min {MIN_SCORE}/13 to trade")
+print("   Core: EMA stack + slope + Supertrend + ADX + CPR + candle")
+print("   Scored: RSI + VWAP + Vol surge + Momentum + BB + breakout")
 print("="*60)
 
 if all([SMARTAPI_KEY,SMARTAPI_CLIENT_ID,SMARTAPI_PASSWORD,SMARTAPI_TOTP_SECRET]):
     threading.Thread(target=login_smartapi,daemon=True).start()
-
 threading.Thread(target=ltp_sampler,   daemon=True).start()
 threading.Thread(target=scheduler_loop,daemon=True).start()
 
