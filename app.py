@@ -161,39 +161,62 @@ DHAN_INTERVAL_MAP = {
     "1m":  "1",
 }
 
-def fetch_dhan_candles(interval="15m", days=30):
-    """
-    Fetch NIFTY 50 candle data from Dhan historical API.
-    Dhan securityId for NIFTY 50 Index = 13
-    exchangeSegment = IDX_I, instrument = INDEX
-    """
-    if not DHAN_ACCESS_TOKEN or not DHAN_CLIENT_ID:
-        return None, "Dhan credentials not set (DHAN_ACCESS_TOKEN, DHAN_CLIENT_ID)"
+# Dhan max intraday window = 30 days per request
+DHAN_CHUNK_DAYS = 28
 
-    dhan_interval = DHAN_INTERVAL_MAP.get(interval, "15")
-    to_dt   = last_trading_day()
-    from_dt = to_dt - datetime.timedelta(days=days + 5)  # extra buffer for weekends
-
-    headers = {
+def _dhan_headers():
+    return {
         'access-token': DHAN_ACCESS_TOKEN,
         'client-id':    DHAN_CLIENT_ID,
         'Content-Type': 'application/json',
         'Accept':       'application/json',
     }
 
-    # Dhan intraday endpoint (for intervals < 1 day)
+def _dhan_parse(data):
+    """Parse Dhan array-format response into a DataFrame."""
+    if not isinstance(data, dict):
+        return None, f"unexpected type {type(data)}"
+    if 'errorCode' in data:
+        return None, f"{data.get('errorCode')}: {data.get('errorMessage','')}"
+    closes = data.get('close', [])
+    if not closes:
+        return None, f"empty close array. keys={list(data.keys())}"
+    timestamps = data.get('timestamp', [])
+    opens   = data.get('open',   [0]*len(closes))
+    highs   = data.get('high',   [0]*len(closes))
+    lows    = data.get('low',    [0]*len(closes))
+    volumes = data.get('volume', [0]*len(closes))
+    rows = []
+    for i in range(len(closes)):
+        try:
+            ts = datetime.datetime.fromtimestamp(int(timestamps[i])) if i < len(timestamps) else datetime.datetime.now()
+        except:
+            ts = datetime.datetime.now() - datetime.timedelta(minutes=(len(closes)-i)*15)
+        rows.append({
+            'timestamp': ts,
+            'open':   float(opens[i])   if i < len(opens)   else float(closes[i]),
+            'high':   float(highs[i])   if i < len(highs)   else float(closes[i]),
+            'low':    float(lows[i])    if i < len(lows)    else float(closes[i]),
+            'close':  float(closes[i]),
+            'volume': float(volumes[i]) if i < len(volumes) else 0,
+        })
+    df = pd.DataFrame(rows).sort_values('timestamp').reset_index(drop=True)
+    return df[df['close']>0], None
+
+def _dhan_chunk(interval, from_dt, to_dt):
+    """Single Dhan API request for one time window."""
+    headers = _dhan_headers()
     if interval != "1d":
         url  = f"{DHAN_BASE}/v2/charts/intraday"
         body = {
             "securityId":      "13",
             "exchangeSegment": "IDX_I",
             "instrument":      "INDEX",
-            "interval":        dhan_interval,
+            "interval":        DHAN_INTERVAL_MAP.get(interval, "15"),
             "fromDate":        from_dt.strftime("%Y-%m-%d"),
             "toDate":          to_dt.strftime("%Y-%m-%d"),
         }
     else:
-        # Daily candles
         url  = f"{DHAN_BASE}/v2/charts/historical"
         body = {
             "securityId":      "13",
@@ -202,71 +225,64 @@ def fetch_dhan_candles(interval="15m", days=30):
             "fromDate":        from_dt.strftime("%Y-%m-%d"),
             "toDate":          to_dt.strftime("%Y-%m-%d"),
         }
+    print(f"  Dhan {interval} {from_dt.date()}→{to_dt.date()}")
+    resp = req.post(url, json=body, headers=headers, timeout=20)
+    data = resp.json()
+    return _dhan_parse(data)
 
-    try:
-        print(f"📡 Dhan fetch: {url} interval={dhan_interval} {from_dt.date()}→{to_dt.date()}")
-        resp = req.post(url, json=body, headers=headers, timeout=20)
-        print(f"   Dhan status: {resp.status_code}")
-        data = resp.json()
-        print(f"   Dhan response keys: {list(data.keys()) if isinstance(data,dict) else type(data)}")
+def fetch_dhan_candles(interval="15m", days=30):
+    """
+    Fetch NIFTY 50 candle data from Dhan, auto-chunked to stay within API limits.
+    Max 30 days per intraday request — this function fetches multiple chunks and merges.
+    securityId=13 (NIFTY 50 Index), exchangeSegment=IDX_I, instrument=INDEX
+    """
+    if not DHAN_ACCESS_TOKEN or not DHAN_CLIENT_ID:
+        return None, "Dhan credentials not set (DHAN_ACCESS_TOKEN, DHAN_CLIENT_ID)"
 
-        # Dhan returns arrays: timestamp, open, high, low, close, volume
-        if isinstance(data, dict) and 'open' in data:
-            timestamps = data.get('timestamp', [])
-            opens      = data.get('open',  [])
-            highs      = data.get('high',  [])
-            lows       = data.get('low',   [])
-            closes     = data.get('close', [])
-            volumes    = data.get('volume', [0]*len(closes))
+    to_dt   = last_trading_day()
+    from_dt = to_dt - datetime.timedelta(days=days + 5)
 
-            if not closes or len(closes) == 0:
-                return None, f"Dhan returned empty arrays. Response: {data}"
+    # Daily — single request fine
+    if interval == "1d":
+        df, err = _dhan_chunk("1d", from_dt, to_dt)
+        if df is not None and len(df) > 0:
+            print(f"✅ Dhan daily: {len(df)} rows")
+            return df, f"Dhan API ({len(df)} daily bars)"
+        return None, f"Dhan daily failed: {err}"
 
-            rows = []
-            for i in range(len(closes)):
-                ts = timestamps[i] if i < len(timestamps) else 0
-                # Dhan timestamps are Unix epoch seconds
-                try:
-                    dt = datetime.datetime.fromtimestamp(int(ts))
-                except:
-                    dt = datetime.datetime.now() - datetime.timedelta(minutes=(len(closes)-i)*15)
-                rows.append({
-                    'timestamp': dt,
-                    'open':      float(opens[i])   if i < len(opens)   else 0,
-                    'high':      float(highs[i])   if i < len(highs)   else 0,
-                    'low':       float(lows[i])    if i < len(lows)    else 0,
-                    'close':     float(closes[i]),
-                    'volume':    float(volumes[i]) if i < len(volumes) else 0,
-                })
+    # Intraday — chunk into 28-day windows
+    frames = []
+    c_end   = to_dt
+    c_start = max(from_dt, c_end - datetime.timedelta(days=DHAN_CHUNK_DAYS))
+    attempts = 0
+    while c_end > from_dt and attempts < 20:
+        attempts += 1
+        try:
+            df_c, err = _dhan_chunk(interval, c_start, c_end)
+            if df_c is not None and len(df_c) > 0:
+                frames.append(df_c)
+                print(f"  ✅ {len(df_c)} rows")
+            else:
+                print(f"  ⚠️ {err}")
+        except Exception as e:
+            print(f"  ❌ chunk err: {e}")
+        c_end   = c_start - datetime.timedelta(days=1)
+        c_start = max(from_dt, c_end - datetime.timedelta(days=DHAN_CHUNK_DAYS))
+        if c_end <= from_dt:
+            break
+        time.sleep(0.5)
 
-            df = pd.DataFrame(rows)
-            df = df.sort_values('timestamp').reset_index(drop=True)
-            df = df[df['close'] > 0]
-            print(f"✅ Dhan: {len(df)} candles")
-            return df, f"Dhan API"
-
-        # Some Dhan endpoints return data differently
-        if isinstance(data, list) and len(data) > 0:
-            rows = []
-            for item in data:
-                rows.append({
-                    'timestamp': datetime.datetime.fromtimestamp(item.get('timestamp', 0)),
-                    'open':   float(item.get('open',  0)),
-                    'high':   float(item.get('high',  0)),
-                    'low':    float(item.get('low',   0)),
-                    'close':  float(item.get('close', 0)),
-                    'volume': float(item.get('volume', 0)),
-                })
-            df = pd.DataFrame(rows).sort_values('timestamp').reset_index(drop=True)
-            df = df[df['close'] > 0]
-            print(f"✅ Dhan (list format): {len(df)} candles")
-            return df, "Dhan API"
-
-        return None, f"Dhan unexpected response format: {str(data)[:300]}"
-
-    except Exception as e:
-        print(f"❌ Dhan fetch error: {e}")
-        return None, f"Dhan error: {str(e)}"
+    if not frames:
+        return None, (
+            "Dhan returned 0 rows. Verify: 1) DHAN_ACCESS_TOKEN set in Railway, "
+            "2) DHAN_CLIENT_ID set in Railway, 3) Dhan data subscription active, "
+            "4) Try /api/debug-data for raw response."
+        )
+    df = pd.concat(frames, ignore_index=True)
+    df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+    df = df[df['close']>0]
+    print(f"✅ Dhan total: {len(df)} rows ({len(frames)} chunks)")
+    return df, f"Dhan API ({len(df)} bars)"
 
 
 # ══════════════════════════════════════════════════════════════
