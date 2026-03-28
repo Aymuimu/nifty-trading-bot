@@ -38,7 +38,7 @@ last_signal    = "Bot not started"
 bot_active     = False
 candle_buffer  = {}
 last_ltp       = None
-data_source    = "smartapi"   # "smartapi" | "dhan"  — toggled via API
+data_source    = "dhan"       # "smartapi" | "dhan"  — toggled via API
 
 LOT_SIZE   = 75
 SA_BASE    = "https://apiconnect.angelbroking.com"
@@ -1013,7 +1013,7 @@ print("=" * 60)
 print(f"🚀 NIFTY Elite Bot | Dual API | 13-pt scoring | Min {MIN_SCORE}/13")
 print(f"   SmartAPI : {'✅ lib OK' if SMARTAPI_AVAILABLE else '❌'}")
 print(f"   Dhan     : {'✅ configured' if (DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID) else '⚠️ no credentials'}")
-print(f"   Default  : {data_source.upper()}")
+print(f"   Default  : DHAN (change via /api/set-source)")
 print("=" * 60)
 
 if all([SMARTAPI_KEY,SMARTAPI_CLIENT_ID,SMARTAPI_PASSWORD,SMARTAPI_TOTP_SECRET]):
