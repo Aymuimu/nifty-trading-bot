@@ -261,6 +261,52 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
   </div>
 </div>
 
+<!-- ACTIVE TRADE PANEL -->
+<div class="panel mt14 hidden" id="active-panel" style="border-color:var(--accent)">
+  <div class="panel-head" style="background:rgba(0,229,160,0.08)">
+    <span>⚡ Active Forward Trade</span>
+    <span class="badge badge-green pulse" id="at-status">OPEN</span>
+  </div>
+  <div class="panel-body">
+    <div class="status-bar" style="margin-bottom:0">
+      <div class="stat-card">
+        <div class="stat-label">Side</div>
+        <div class="stat-value" id="at-side">–</div>
+        <div class="stat-sub" id="at-time">–</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Entry</div>
+        <div class="stat-value" id="at-entry">–</div>
+        <div class="stat-sub">NIFTY index</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Live Price</div>
+        <div class="stat-value blue" id="at-live">–</div>
+        <div class="stat-sub" id="at-move">–</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Unrealised P&L</div>
+        <div class="stat-value" id="at-unrel">₹0</div>
+        <div class="stat-sub" id="at-tp-hit">–</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">SL Level</div>
+        <div class="stat-value red" id="at-sl">–</div>
+        <div class="stat-sub">Stop loss</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">TP Level</div>
+        <div class="stat-value green" id="at-tp">–</div>
+        <div class="stat-sub">Target ₹1500</div>
+      </div>
+    </div>
+    <div style="margin-top:12px;padding:10px 14px;background:var(--surface);border-radius:8px;font-family:var(--mono);font-size:12px;color:var(--sub)">
+      ℹ️ This is a REAL forward test — P&L is calculated from actual NIFTY price movement, not random simulation.
+      SL = ₹350 | TP = ₹1500 | Extended = ₹5000 (if TP hit and price keeps running)
+    </div>
+  </div>
+</div>
+
 <!-- BACKTEST RESULTS -->
 <div class="panel mt14 hidden" id="bt-panel">
   <div class="panel-head"><span>📊 Backtest Results</span><span class="badge badge-blue" id="bt-src-badge">–</span></div>
@@ -554,6 +600,42 @@ async function runBacktest(){
   }catch(e){ btn.disabled=false; btn.textContent='📊 Run Backtest'; clog(`❌ Backtest error: ${e.message}`,'err'); }
 }
 
+// ── Active trade polling ──────────────────────────────────
+async function pollActiveTrade(){
+  try{
+    const r=await fetch(`${API}/api/bot-status`);
+    const d=await r.json();
+    const at=d.active_trade;
+    const panel=document.getElementById('active-panel');
+    if(at){
+      panel.classList.remove('hidden');
+      const side=at.side;
+      const sc=side==='CALL'?'green':'red';
+      document.getElementById('at-side').textContent=side;
+      document.getElementById('at-side').className='stat-value '+sc;
+      document.getElementById('at-time').textContent=`Entered ${at.entry_time||''}`;
+      document.getElementById('at-entry').textContent=`₹${at.entry?.toFixed(0)||'–'}`;
+      document.getElementById('at-live').textContent=at.live_price?`₹${at.live_price.toFixed(0)}`:'–';
+      const mv=at.move_pts||0;
+      document.getElementById('at-move').textContent=`${mv>=0?'+':''}${mv.toFixed(1)} pts`;
+      const ur=at.unrealised||0;
+      document.getElementById('at-unrel').textContent=`${ur>=0?'+':''}₹${ur}`;
+      document.getElementById('at-unrel').className='stat-value '+(ur>=0?'green':'red');
+      document.getElementById('at-tp-hit').textContent=at.tp_hit?'🎯 TP HIT — trailing!':'Watching...';
+      document.getElementById('at-sl').textContent=at.sl_level?`₹${at.sl_level}`:'–';
+      document.getElementById('at-tp').textContent=at.tp_level?`₹${at.tp_level}`:'–';
+    } else {
+      panel.classList.add('hidden');
+    }
+    // update stats
+    document.getElementById('cap-disp').textContent='₹'+d.capital.toLocaleString('en-IN');
+    const pnlEl=document.getElementById('pnl-disp');
+    pnlEl.textContent=(d.today_pnl>=0?'+':'')+'₹'+d.today_pnl;
+    pnlEl.className='stat-value '+(d.today_pnl>=0?'green':'red');
+    document.getElementById('trades-disp').textContent=`${d.today_trades}/2 trades today`;
+  }catch(e){}
+}
+
 // ── Init ───────────────────────────────────────────────────
 window.onload=async()=>{
   // Set default source to Dhan
@@ -561,6 +643,8 @@ window.onload=async()=>{
   await fetchMarket();
   await checkSession();
   setInterval(fetchMarket,60000);
+  setInterval(pollActiveTrade,15000);   // poll active trade every 15s
+  pollActiveTrade();
   clog('» Bot ready. Dhan is selected as data source.','info');
 };
 </script>
