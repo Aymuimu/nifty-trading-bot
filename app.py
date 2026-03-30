@@ -685,36 +685,185 @@ def scheduler_loop():
         except Exception as e: print(f"❌ Scheduler: {e}")
         time.sleep(300)
 
-def scan_for_trade():
-    global last_signal,today_trades,today_pnl,sl_hit_today,capital,trade_log
-    try:
-        ind,err=get_indicators()
-        if err or ind is None: last_signal=f"⚠️ {err}"; return
-        s=ind['signals']; price=ind['price']; ts=ist_now().strftime("%H:%M")
-        if not s['trading_window']: last_signal=f"⏳ Outside window [{ts}]"; return
-        if s['inside_cpr']:         last_signal=f"⚠️ Inside CPR [{ts}]"; return
-        if s['call_ready']:
-            last_signal=f"🟢 CALL ✅ {s['call_score']}/7 @ ₹{price:.0f} [{ts}]"
-            _sim("CALL",price)
-        elif s['put_ready']:
-            last_signal=f"🔴 PUT ✅ {s['put_score']}/7 @ ₹{price:.0f} [{ts}]"
-            _sim("PUT",price)
-        else:
-            last_signal=f"⏳ Score {s['call_score']}/7 [{ts}]"
-    except Exception as e: last_signal=f"Scan: {e}"
+# ── Active forward trade tracker ─────────────────────────────
+active_trade = None   # dict when a trade is open, None otherwise
 
-def _sim(side,price):
-    global today_trades,today_pnl,sl_hit_today,capital,trade_log
-    import random; r=random.random()
-    if r<0.12:   pnl=EXT_RS; outcome="EXT TARGET ₹5000"
-    elif r<0.82: pnl=TP_RS;  outcome="TARGET ₹1500"
-    else:        pnl=-SL_RS; outcome="SL HIT ₹350"
-    capital+=pnl; today_pnl+=pnl; today_trades+=1
-    if pnl<0: sl_hit_today=True
-    trade_log.insert(0,{'time':ist_now().strftime("%H:%M"),'date':str(ist_now().date()),
-                         'side':side,'entry':round(price,2),'pnl':pnl,
-                         'outcome':outcome,'capital':round(capital,2)})
-    trade_log[:]=trade_log[:50]
+def scan_for_trade():
+    """
+    Called every 5 min by scheduler.
+    1. If an open trade exists → check if SL/TP hit using live price.
+    2. If no open trade → look for a new entry using strategy filters.
+    NO random outcomes. Every P&L is based on real NIFTY price movement.
+    """
+    global last_signal, today_trades, today_pnl, sl_hit_today, capital
+    global trade_log, active_trade
+
+    ts = ist_now().strftime("%H:%M")
+    live_price, _ = get_nifty_price()
+    if live_price is None:
+        last_signal = f"⚠️ Cannot get live price [{ts}]"; return
+
+    # ── Step 1: manage open trade ──────────────────────────────
+    if active_trade is not None:
+        _monitor_open_trade(live_price, ts)
+        return
+
+    # ── Step 2: look for new entry ─────────────────────────────
+    if today_trades >= 2:
+        last_signal = f"⏹ Max 2 trades reached today [{ts}]"; return
+    if sl_hit_today:
+        last_signal = f"⛔ SL hit today — no more trades [{ts}]"; return
+
+    try:
+        ind, err = get_indicators()
+        if err or ind is None:
+            last_signal = f"⚠️ {err}"; return
+        s     = ind['signals']
+        price = live_price   # always use freshest price
+        if not s['trading_window']:
+            last_signal = f"⏳ Outside window [{ts}]"; return
+        if s['inside_cpr']:
+            last_signal = f"⚠️ Price inside CPR zone — no trade [{ts}]"; return
+
+        if s['call_ready']:
+            _open_trade("CALL", price, s['call_score'], ts)
+        elif s['put_ready']:
+            _open_trade("PUT", price, s['put_score'], ts)
+        else:
+            cr = s.get('call_reasons', {})
+            failing = [k for k,v in cr.items() if not v]
+            last_signal = (f"⏳ Score {s['call_score']}/7 — "
+                           f"failing: {', '.join(failing[:3]) or 'filters'} [{ts}]")
+    except Exception as e:
+        last_signal = f"Scan error: {e}"
+
+
+def _open_trade(side, entry_price, score, ts):
+    """Open a new forward trade with real entry price."""
+    global active_trade, last_signal
+    active_trade = {
+        'side':       side,
+        'entry':      entry_price,
+        'entry_time': ts,
+        'score':      score,
+        'date':       str(ist_now().date()),
+        'tp_hit':     False,       # True after base TP reached (trail mode)
+        'trail_ref':  entry_price, # reference for trail stop
+        'max_pts':    0.0,         # max favourable excursion (pts)
+    }
+    last_signal = (f"{'🟢 CALL' if side=='CALL' else '🔴 PUT'} OPENED "
+                   f"@ ₹{entry_price:.0f} | Score {score}/7 "
+                   f"| SL ₹{SL_RS} | TP ₹{TP_RS} [{ts}]")
+    print(f"✅ Forward trade opened: {side} @ {entry_price}")
+
+
+def _monitor_open_trade(live_price, ts):
+    """
+    Check if open trade has hit SL, TP, or extended target.
+    Uses live NIFTY price to determine P&L — no random numbers.
+    """
+    global active_trade, today_trades, today_pnl, sl_hit_today
+    global capital, trade_log, last_signal
+
+    t   = active_trade
+    ep  = t['entry']
+    side= t['side']
+
+    # Calculate current move in index points
+    if side == "CALL":
+        move_pts = live_price - ep   # positive = profit direction
+    else:
+        move_pts = ep - live_price   # positive = profit direction
+
+    # Update max favourable excursion
+    t['max_pts'] = max(t['max_pts'], move_pts)
+
+    # Current unrealised P&L
+    unrealised = int(move_pts * DELTA * LOT_SIZE)
+
+    # ── Check SL ──────────────────────────────────────────────
+    if move_pts <= -SL_PTS:
+        _close_trade(-SL_RS, "SL HIT", ts)
+        return
+
+    # ── Trail stop after TP hit ────────────────────────────────
+    if t['tp_hit']:
+        # Trail reference moves up (call) / down (put) with price
+        if side == "CALL":
+            t['trail_ref'] = max(t['trail_ref'], live_price - SL_PTS * 0.5)
+            if live_price < t['trail_ref']:
+                trail_pts = t['trail_ref'] - ep
+                trail_pnl = int(trail_pts * DELTA * LOT_SIZE)
+                _close_trade(max(0, trail_pnl), "TRAIL EXIT", ts)
+                return
+        else:
+            t['trail_ref'] = min(t['trail_ref'], live_price + SL_PTS * 0.5)
+            if live_price > t['trail_ref']:
+                trail_pts = ep - t['trail_ref']
+                trail_pnl = int(trail_pts * DELTA * LOT_SIZE)
+                _close_trade(max(0, trail_pnl), "TRAIL EXIT", ts)
+                return
+        # Extended target
+        if move_pts >= EXT_PTS:
+            _close_trade(EXT_RS, "EXT TARGET ₹5000 🚀", ts)
+            return
+
+    # ── Base TP hit → switch to trail mode ────────────────────
+    if not t['tp_hit'] and move_pts >= TP_PTS:
+        t['tp_hit']    = True
+        t['trail_ref'] = ep   # trail stop at breakeven
+        last_signal    = (f"{'🟢' if side=='CALL' else '🔴'} TP HIT ₹1500 ✅ "
+                          f"— trailing for ₹5000 target [{ts}]")
+        print(f"✅ TP hit @ {live_price:.0f}, trailing...")
+        return
+
+    # ── Auto exit at end of trading window ────────────────────
+    t_now = ist_now().time()
+    window_end_m = datetime.time(11, 15)
+    window_end_a = datetime.time(14, 45)
+    at_window_end = (t_now >= window_end_m and datetime.time(10,0)<=t_now) or \
+                    (t_now >= window_end_a and datetime.time(13,45)<=t_now)
+
+    if at_window_end:
+        pnl = max(-SL_RS, min(EXT_RS, unrealised))
+        _close_trade(pnl, "WINDOW END", ts)
+        return
+
+    # ── Still open — update signal ────────────────────────────
+    pnl_str = f"+₹{unrealised}" if unrealised >= 0 else f"-₹{abs(unrealised)}"
+    last_signal = (f"{'🟢' if side=='CALL' else '🔴'} {side} OPEN "
+                   f"@ ₹{ep:.0f} | Now ₹{live_price:.0f} | "
+                   f"P&L: {pnl_str} | Max: +{t['max_pts']:.1f}pts [{ts}]")
+
+
+def _close_trade(pnl, outcome, ts):
+    """Close the active trade and record it."""
+    global active_trade, today_trades, today_pnl, sl_hit_today, capital, trade_log
+    t = active_trade
+    capital    += pnl
+    today_pnl  += pnl
+    today_trades += 1
+    if pnl < 0: sl_hit_today = True
+    active_trade = None
+
+    emoji = "✅" if pnl > 0 else ("🚀" if pnl >= EXT_RS else "❌")
+    global last_signal
+    last_signal = (f"{emoji} {t['side']} CLOSED | Entry ₹{t['entry']:.0f} | "
+                   f"{outcome} | P&L: {'+'if pnl>=0 else ''}₹{pnl} [{ts}]")
+
+    trade_log.insert(0, {
+        'time':     ts,
+        'date':     t['date'],
+        'side':     t['side'],
+        'entry':    round(t['entry'], 2),
+        'pnl':      pnl,
+        'outcome':  outcome,
+        'capital':  round(capital, 2),
+        'score':    t.get('score', 0),
+        'max_pts':  round(t.get('max_pts', 0), 1),
+    })
+    trade_log[:] = trade_log[:50]
+    print(f"{'✅' if pnl>0 else '❌'} Trade closed: {t['side']} | {outcome} | ₹{pnl}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -777,10 +926,20 @@ def api_indicators():
 
 @app.route('/api/bot-status')
 def api_bot_status():
+    at = None
+    if active_trade:
+        lp,_ = get_nifty_price()
+        ep   = active_trade['entry']; side = active_trade['side']
+        move = (lp-ep) if side=="CALL" else (ep-lp) if lp else 0
+        unrel= int(move*DELTA*LOT_SIZE) if lp else 0
+        at   = {**active_trade,'live_price':lp,'move_pts':round(move,1),
+                'unrealised':unrel,
+                'sl_level':round(ep-SL_PTS,1) if side=="CALL" else round(ep+SL_PTS,1),
+                'tp_level':round(ep+TP_PTS,1) if side=="CALL" else round(ep-TP_PTS,1)}
     return jsonify({'bot_active':bot_active,'logged_in':smart_obj is not None,
         'today_trades':today_trades,'today_pnl':today_pnl,'capital':capital,
         'sl_hit':sl_hit_today,'last_signal':last_signal,'trade_log':trade_log[:10],
-        'buffer_bars':len(candle_buffer),'data_source':data_source,
+        'active_trade':at,'buffer_bars':len(candle_buffer),'data_source':data_source,
         'ist_time':ist_now().strftime('%H:%M:%S')})
 
 @app.route('/api/trades')
