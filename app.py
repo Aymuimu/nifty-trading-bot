@@ -858,3 +858,164 @@ threading.Thread(target=scheduler_loop,daemon=True).start()
 if __name__=='__main__':
     port=int(os.environ.get('PORT',5000))
     app.run(host='0.0.0.0',port=port,debug=False)
+
+
+# ══════════════════════════════════════════════════════════════
+#  DIAGNOSTIC BACKTEST — shows exactly what is happening
+# ══════════════════════════════════════════════════════════════
+@app.route('/api/diagnose')
+def api_diagnose():
+    """
+    Step-by-step diagnosis. Open this URL and share the result.
+    It shows: data quality, indicator values, why each bar
+    is rejected, and 10 sample entry/exit P&L calculations.
+    """
+    result = {}
+
+    # Step 1: fetch data
+    if data_source == "dhan":
+        df, src = fetch_dhan("15m", 30)
+    else:
+        df, src = fetch_smartapi("15m", 30)
+
+    result['step1_data'] = {
+        'source': src,
+        'rows':   len(df) if df is not None else 0,
+        'ok':     df is not None and len(df) > 20,
+    }
+
+    if df is None or len(df) < 5:
+        result['error'] = 'No data fetched'; return jsonify(result)
+
+    # Step 2: data quality
+    result['step2_quality'] = {
+        'close_min':  round(float(df['close'].min()), 2),
+        'close_max':  round(float(df['close'].max()), 2),
+        'close_std':  round(float(df['close'].std()), 2),
+        'avg_hl':     round(float((df['high']-df['low']).mean()), 2),
+        'zero_hl_pct':round(float((df['high']==df['low']).mean()*100), 1),
+        'sample_rows': df.tail(5)[['timestamp','open','high','low','close','volume']].assign(
+            timestamp=lambda x: x['timestamp'].astype(str)).to_dict('records'),
+    }
+
+    # Step 3: indicators
+    df = add_ind(df)
+    result['step3_indicators'] = {
+        'rows_after': len(df),
+        'sample_indicators': df.tail(3)[['timestamp','close','e9','e21','rsi','sd']].assign(
+            timestamp=lambda x: x['timestamp'].astype(str)).round(2).to_dict('records'),
+    }
+
+    # Step 4: CPR
+    df['date'] = df['timestamp'].dt.date
+    dates = sorted(df['date'].unique())
+    cpr_samples = []
+    for i in range(min(3, len(dates)-1), -1, -1):
+        if i == 0: continue
+        prev_d = df[df['date'] == dates[i-1]]
+        if len(prev_d) == 0: continue
+        cpr_ = calc_cpr(float(prev_d['high'].max()),
+                        float(prev_d['low'].min()),
+                        float(prev_d['close'].iloc[-1]))
+        today_d = df[df['date'] == dates[i]]
+        if len(today_d) == 0: continue
+        price_ = float(today_d['close'].iloc[-1])
+        cpr_samples.append({
+            'date':       str(dates[i]),
+            'cpr_top':    cpr_['cpr_top'],
+            'cpr_bottom': cpr_['cpr_bottom'],
+            'price':      price_,
+            'above_top':  price_ > cpr_['cpr_top'],
+            'below_bot':  price_ < cpr_['cpr_bottom'],
+        })
+    result['step4_cpr_samples'] = cpr_samples
+
+    # Step 5: scan all bars in last 5 days for entries
+    entry_log = []
+    for i, date in enumerate(dates[-6:]):
+        if i == 0: continue
+        prev_d = df[df['date'] == dates[dates.index(date)-1]]
+        if len(prev_d) == 0: continue
+        day_cpr = calc_cpr(float(prev_d['high'].max()),
+                           float(prev_d['low'].min()),
+                           float(prev_d['close'].iloc[-1]))
+        today_d = df[df['date'] == date].reset_index(drop=True)
+        for idx in range(1, len(today_d)):
+            t = today_d.iloc[idx]['timestamp'].time()
+            in_win = (datetime.time(10,0)<=t<=datetime.time(11,15) or
+                      datetime.time(13,45)<=t<=datetime.time(14,45))
+            cp, cs, cr = check_entry(today_d, idx, day_cpr, True)
+            pp, ps, pr = check_entry(today_d, idx, day_cpr, False)
+            r_ = today_d.iloc[idx]
+            entry_log.append({
+                'date':       str(date),
+                'time':       str(t)[:5],
+                'in_window':  in_win,
+                'price':      round(float(r_.get('close',0)),1),
+                'e9':         round(float(r_.get('e9',0)),1),
+                'e21':        round(float(r_.get('e21',0)),1),
+                'rsi':        round(float(r_.get('rsi',50)),1),
+                'sd':         int(r_.get('sd',0)),
+                'cpr_top':    day_cpr['cpr_top'],
+                'call_pass':  cp, 'call_score': cs,
+                'put_pass':   pp, 'put_score':  ps,
+                'call_fail_reasons': [k for k,v in cr.items() if not v],
+                'put_fail_reasons':  [k for k,v in pr.items() if not v],
+            })
+
+    result['step5_entry_scan_last5days'] = {
+        'total_bars_scanned': len(entry_log),
+        'in_window':          sum(1 for e in entry_log if e['in_window']),
+        'call_passes':        sum(1 for e in entry_log if e['call_pass']),
+        'put_passes':         sum(1 for e in entry_log if e['put_pass']),
+        'most_common_call_fails': _count_fails([e['call_fail_reasons'] for e in entry_log]),
+        'most_common_put_fails':  _count_fails([e['put_fail_reasons']  for e in entry_log]),
+        'sample_bars_in_window': [e for e in entry_log if e['in_window']][:10],
+    }
+
+    # Step 6: test exit on 5 real entries (forced, ignore filters)
+    exit_tests = []
+    forced = 0
+    for i, date in enumerate(dates[-6:]):
+        if i == 0 or forced >= 5: break
+        prev_d = df[df['date'] == dates[dates.index(date)-1]]
+        if len(prev_d) == 0: continue
+        day_cpr = calc_cpr(float(prev_d['high'].max()),
+                           float(prev_d['low'].min()),
+                           float(prev_d['close'].iloc[-1]))
+        today_d = df[df['date'] == date].reset_index(drop=True)
+        for idx in range(1, len(today_d)):
+            t = today_d.iloc[idx]['timestamp'].time()
+            if not (datetime.time(10,0)<=t<=datetime.time(11,15) or
+                    datetime.time(13,45)<=t<=datetime.time(14,45)): continue
+            entry_ = float(today_d.iloc[idx]['close'])
+            pnl_c, out_c = exit_trade(today_d, idx, "CALL")
+            pnl_p, out_p = exit_trade(today_d, idx, "PUT")
+            # Show next 5 closes
+            next_closes = [round(float(today_d.iloc[min(idx+j,len(today_d)-1)]['close']),1)
+                           for j in range(1, min(6, len(today_d)-idx))]
+            exit_tests.append({
+                'date': str(date), 'time': str(t)[:5],
+                'entry': round(entry_, 1),
+                'next_5_closes': next_closes,
+                'call_pnl': pnl_c, 'call_outcome': out_c,
+                'put_pnl':  pnl_p, 'put_outcome':  out_p,
+            })
+            forced += 1
+            break
+
+    result['step6_forced_exit_tests'] = {
+        'note': 'These are forced entries (ignoring filters) to test if exit engine works',
+        'tp_pts': round(TP_PTS, 1), 'sl_pts': round(SL_PTS, 1),
+        'tests': exit_tests,
+    }
+
+    return jsonify(result)
+
+
+def _count_fails(fail_lists):
+    counts = {}
+    for lst in fail_lists:
+        for item in lst:
+            counts[item] = counts.get(item, 0) + 1
+    return sorted(counts.items(), key=lambda x: -x[1])[:5]
