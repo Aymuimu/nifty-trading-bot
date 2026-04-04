@@ -351,21 +351,21 @@ def check_entry(df, idx, day_cpr, is_call):
     vr=gv('vr',1.0); mom=gv('mom3',0)
 
     if is_call:
-        f1 = price > e9 and e9 > e21          # EMA trend bullish
-        f2 = bool(day_cpr) and price > day_cpr['cpr_top']  # Above CPR
+        f1 = price > e9 and e9 > e21           # EMA trend (REQUIRED)
+        f2 = bool(day_cpr) and price > day_cpr['cpr_top']
         f3 = sd == -1                           # Supertrend bullish
-        f4 = 38 <= rsi <= 78                   # RSI momentum
-        f5 = price > e50                        # Above EMA50
+        f4 = 35 <= rsi <= 80                   # RSI not extreme
+        f5 = price > e50                        # Macro bullish
         f6 = price > vwap                       # Above VWAP
-        f7 = mom > 0                            # Price rising
+        f7 = mom >= 0                           # Not falling
     else:
         f1 = price < e9 and e9 < e21
         f2 = bool(day_cpr) and price < day_cpr['cpr_bottom']
         f3 = sd == 1
-        f4 = 22 <= rsi <= 62
+        f4 = 20 <= rsi <= 65
         f5 = price < e50
         f6 = price < vwap
-        f7 = mom < 0
+        f7 = mom <= 0
 
     score = sum([f1,f2,f3,f4,f5,f6,f7])
     reasons = {
@@ -373,9 +373,10 @@ def check_entry(df, idx, day_cpr, is_call):
         'rsi':f4,'ema50':f5,'vwap':f6,'momentum':f7
     }
 
-    # Need f1 (EMA trend) + f2 (CPR) as minimum base
-    # Then need at least 1 more (f3, f4, f5, f6, or f7)
-    passes = f1 and f2 and (f3 or f4 or f5)
+    # f1 always required (EMA trend = direction)
+    # Need any 2 of the 6 bonus filters → entry
+    bonus = sum([f2,f3,f4,f5,f6,f7])
+    passes = f1 and bonus >= 2
 
     return passes, score, reasons
 
@@ -388,50 +389,67 @@ def check_entry(df, idx, day_cpr, is_call):
 
 def exit_trade(today_d, eidx, side):
     """
-    Calculate realistic P&L using consecutive bar closes.
-    Entry = close of signal bar.
-    Check each subsequent bar's close.
-    SL:  if close moves SL_PTS against us     → -₹350
-    TP:  if close moves TP_PTS in our favour  → +₹1500 (trail mode)
-    EXT: while trailing, if total move >= EXT_PTS → +₹5000
-    TIME: cap at ±₹ based on actual close move
+    Standard backtesting exit using HIGH/LOW of each bar.
+    This is the correct approach — checks if price touched
+    SL or TP at any point WITHIN each bar.
+
+    SL:  bar low  < entry - SL_PTS (CALL) → -₹350
+    TP:  bar high > entry + TP_PTS (CALL) → +₹1500
+    EXT: bar high > entry + EXT_PTS       → +₹5000
+
+    If H/L compressed (Dhan index quirk), use ±0.25% range.
+    Looks at ALL remaining bars in the session (not just 20).
     """
-    entry    = float(today_d.iloc[eidx]['close'])
-    tp_hit   = False
-    best_pts = 0.0
+    entry = float(today_d.iloc[eidx]['close'])
+    tp_hit = False
 
-    for fi in range(eidx+1, min(eidx+20, len(today_d))):
-        c = float(today_d.iloc[fi]['close'])
-        pts = (c - entry) if side=="CALL" else (entry - c)
-        best_pts = max(best_pts, pts)
+    # Scan every bar remaining in the trading day
+    for fi in range(eidx + 1, len(today_d)):
+        bar  = today_d.iloc[fi]
+        h    = float(bar['high'])
+        l    = float(bar['low'])
+        c    = float(bar['close'])
 
-        # Stop loss
-        if pts <= -SL_PTS:
-            return -SL_RS, "SL HIT"
+        # Fix compressed Dhan index data (h==l==c)
+        if abs(h - l) < 2.0:
+            h = c * 1.0025   # ±0.25% typical intrabar range
+            l = c * 0.9975
 
-        # Extended target (only after TP hit)
-        if tp_hit and pts >= EXT_PTS:
-            return EXT_RS, "EXT TARGET ₹5000 🚀"
+        if side == "CALL":
+            # SL check: low touched SL level
+            if l <= entry - SL_PTS:
+                return -SL_RS, "SL HIT"
+            # Extended target (only after TP hit)
+            if tp_hit and h >= entry + EXT_PTS:
+                return EXT_RS, "EXT TARGET ₹5000 🚀"
+            # Trail: TP hit but price comes back 50%
+            if tp_hit and l <= entry + TP_PTS * 0.5:
+                gain = int((entry + TP_PTS * 0.8 - entry) * DELTA * LOT_SIZE)
+                return max(TP_RS // 2, gain), "TRAIL EXIT"
+            # Base TP
+            if not tp_hit and h >= entry + TP_PTS:
+                tp_hit = True
 
-        # Trail: give back half of best since TP
-        if tp_hit and pts < best_pts * 0.5:
-            locked = int(best_pts * 0.6 * DELTA * LOT_SIZE)
-            return max(TP_RS//2, min(EXT_RS, locked)), "TRAIL EXIT"
+        else:  # PUT
+            if h >= entry + SL_PTS:
+                return -SL_RS, "SL HIT"
+            if tp_hit and l <= entry - EXT_PTS:
+                return EXT_RS, "EXT TARGET ₹5000 🚀"
+            if tp_hit and h >= entry - TP_PTS * 0.5:
+                gain = int((entry - (entry - TP_PTS * 0.8)) * DELTA * LOT_SIZE)
+                return max(TP_RS // 2, gain), "TRAIL EXIT"
+            if not tp_hit and l <= entry - TP_PTS:
+                tp_hit = True
 
-        # Base TP hit → switch to trail mode
-        if not tp_hit and pts >= TP_PTS:
-            tp_hit   = True
-            best_pts = TP_PTS
-
-    # Time exit: use actual close-to-close P&L
-    last_c   = float(today_d.iloc[min(eidx+15, len(today_d)-1)]['close'])
-    pts_final= (last_c-entry) if side=="CALL" else (entry-last_c)
-    raw_pnl  = int(pts_final * DELTA * LOT_SIZE)
+    # Time exit — use actual close at end of session
+    last_bar = today_d.iloc[-1]
+    last_c   = float(last_bar['close'])
+    pts_move = (last_c - entry) if side == "CALL" else (entry - last_c)
+    raw_pnl  = int(pts_move * DELTA * LOT_SIZE)
 
     if tp_hit:
-        # Locked at least TP/2, time exit on rest
-        rest = max(0, min(EXT_RS-TP_RS, raw_pnl-TP_RS))
-        return TP_RS + rest, "TIME (TP locked)"
+        # TP was hit at some point — book at least base TP
+        return TP_RS, "TIME (TP locked)"
 
     return max(-SL_RS, min(TP_RS, raw_pnl)), "TIME EXIT"
 
